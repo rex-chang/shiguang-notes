@@ -41,13 +41,16 @@ import {
   getInitialFooterVia,
   getInitialNoteCardTheme,
   getInitialNoteWorkspace,
+  getAnonymousNoteWorkspace,
+  isAnonymousWorkspaceFromLegacy,
   getRenderMode,
   isSmartisanWebTestDataMode,
   NOTE_CARD_THEME_STORAGE_KEY,
   persistAiEnabled,
+  persistAnonymousNoteWorkspace,
   persistFooterLogoUrl,
   persistFooterText,
-  persistNoteWorkspace,
+  clearLegacyNoteStorage,
   THEME_STORAGE_KEY,
 } from "./lib/app-state";
 import { getAiStatus } from "./lib/ai";
@@ -59,10 +62,12 @@ import {
   getAuthState,
   getAuthSession,
   getCloudWorkspace,
+  isWorkspaceConflictError,
   loginUser,
   logoutUser,
   resetHermesSkillInstallLink,
   saveCloudWorkspace,
+  updateCloudWorkspaceRevision,
   type AuthUser,
 } from "./lib/auth";
 import { copyTextToClipboard, normalizeClipboardMarkdown } from "./lib/clipboard";
@@ -141,6 +146,8 @@ interface NoteRouteNavigation {
 const NOTE_REFRESH_DELAY_MS = 650;
 const CLOUD_SAVE_DELAY_MS = 650;
 const CLOUD_POLL_INTERVAL_MS = 15_000;
+const NATIVE_CONFLICT_RETRY_LIMIT = 2;
+const NATIVE_CONFLICT_RETRY_DELAY_MS = 800;
 const HERMES_SKILL_LINK_RESET_CONFIRMATION = {
   title: "重置 Hermes 安装链接？",
   description:
@@ -347,6 +354,8 @@ export default function App() {
   const [nativeReadOnly, setNativeReadOnly] = useState(false);
   const [nativeSwitching, setNativeSwitching] = useState(false);
   const cloudFailureRef = useRef(false);
+  const cloudConflictRetryCountRef = useRef(0);
+  const cloudConflictRetryTimeoutRef = useRef<number | null>(null);
   const [authStatus, setAuthStatus] = useState<"loading" | "ready">("loading");
   const [cloudSyncState, setCloudSyncState] = useState<
     "local" | "syncing" | "synced" | "failed"
@@ -410,6 +419,7 @@ export default function App() {
       save: saveCloudWorkspace,
       onSaved: (stored) => {
         cloudFailureRef.current = false;
+        cloudConflictRetryCountRef.current = 0;
         cloudRevisionRef.current = stored.updatedAt ?? Date.now();
 
         // 队列里还有更新的快照或新的防抖定时器时保持“同步中”，
@@ -428,6 +438,40 @@ export default function App() {
         setCloudSyncState("synced");
       },
       onError: (error) => {
+        // 原生模式 409 表示其他设备已写入新版本。先读取 revision 再有限重试，
+        // 避免一次冲突后轮询被永久阻断、后续保存持续失败。
+        if (
+          isNative &&
+          isWorkspaceConflictError(error) &&
+          cloudConflictRetryCountRef.current < NATIVE_CONFLICT_RETRY_LIMIT
+        ) {
+          cloudConflictRetryCountRef.current += 1;
+          cloudFailureRef.current = true;
+          setCloudSyncError("");
+          setCloudSyncState("syncing");
+
+          if (cloudConflictRetryTimeoutRef.current !== null) {
+            window.clearTimeout(cloudConflictRetryTimeoutRef.current);
+          }
+
+          cloudConflictRetryTimeoutRef.current = window.setTimeout(() => {
+            cloudConflictRetryTimeoutRef.current = null;
+            void getCloudWorkspace()
+              .then(() => {
+                cloudSaveQueueRef.current?.enqueue(getCurrentWorkspace());
+              })
+              .catch((refreshError) => {
+                setCloudSyncError(
+                  refreshError instanceof Error
+                    ? refreshError.message
+                    : "云端便签同步恢复失败。",
+                );
+                setCloudSyncState("failed");
+              });
+          }, NATIVE_CONFLICT_RETRY_DELAY_MS);
+          return;
+        }
+
         cloudFailureRef.current = true;
         setCloudSyncError(
           error instanceof Error ? error.message : "云端便签保存失败。",
@@ -591,10 +635,12 @@ export default function App() {
 
     void (async () => {
       let session: AuthUser | null;
+      let authRequiresLogin = false;
 
       try {
         const authState = await getAuthState();
         session = authState.user;
+        authRequiresLogin = authState.requireLogin;
 
         if (cancelled) {
           return;
@@ -624,12 +670,23 @@ export default function App() {
         return;
       }
 
-      // 身份确认后立刻进入界面，云端工作区在后台补齐，避免每次打开都停在加载页。
-      setAuthStatus("ready");
-
       if (!canUseCloudWorkspace(session)) {
+        // 只有确认没有登录会话后才加载匿名正文；强制登录模式不读取本机内容。
+        if (!isNative && !authRequiresLogin) {
+          const anonymousWorkspace = getAnonymousNoteWorkspace();
+
+          if (anonymousWorkspace) {
+            replaceWorkspace(anonymousWorkspace);
+          }
+        }
+
+        setAuthStatus("ready");
         return;
       }
+
+      // 登录态只信任云端工作区。旧版全局键可能是上一个账号留下的正文，
+      // 不能再作为新账号的初始工作区或退出后的匿名工作区。
+      clearLegacyNoteStorage();
 
       try {
         setCloudSyncState("syncing");
@@ -644,14 +701,26 @@ export default function App() {
           replaceWorkspace(cloud.workspace);
           cloudRevisionRef.current = cloud.updatedAt ?? 0;
         } else {
-          const saved = await saveCloudWorkspace(getCurrentWorkspace());
+          // 首次登录只迁移新的匿名工作区；旧版迁移内容可能是上一个账号的正文，
+          // 不允许自动上传到新账号。
+          const anonymousWorkspace = getAnonymousNoteWorkspace({
+            allowLegacyMigration: false,
+          });
+          const initialWorkspace =
+            !authRequiresLogin &&
+            anonymousWorkspace &&
+            !isAnonymousWorkspaceFromLegacy()
+              ? anonymousWorkspace
+              : getInitialNoteWorkspace();
+          const saved = await saveCloudWorkspace(initialWorkspace);
 
           if (cancelled) {
             return;
           }
 
-          cloudRevisionRef.current = saved.updatedAt ?? 0;
           skipNextCloudSaveRef.current = true;
+          replaceWorkspace(initialWorkspace);
+          cloudRevisionRef.current = saved.updatedAt ?? 0;
         }
 
         cloudHydratedUserIdRef.current = session.id;
@@ -663,6 +732,10 @@ export default function App() {
             error instanceof Error ? error.message : "云端同步初始化失败。",
           );
         }
+      }
+
+      if (!cancelled) {
+        setAuthStatus("ready");
       }
     })();
 
@@ -722,7 +795,7 @@ export default function App() {
       return;
     }
 
-    persistNoteWorkspace({
+    persistAnonymousNoteWorkspace({
       activeNoteId,
       folders,
       notes: noteDocuments,
@@ -788,7 +861,7 @@ export default function App() {
       }
 
       refreshing = true;
-      void getCloudWorkspace()
+      void getCloudWorkspace({ updateRevision: false })
         .then((cloud) => {
           if (
             cloud.workspace &&
@@ -799,6 +872,7 @@ export default function App() {
             })
           ) {
             cloudRevisionRef.current = cloud.updatedAt ?? 0;
+            updateCloudWorkspaceRevision(cloud.updatedAt);
             skipNextCloudSaveRef.current = true;
             replaceWorkspace(cloud.workspace, {
               preserveActiveNote: true,
@@ -879,7 +953,12 @@ export default function App() {
 
     const flushWorkspace = () => {
       const workspace = getCurrentWorkspace();
-      persistNoteWorkspace(workspace);
+
+      // 登录账号只写云端；本地键只属于匿名模式，避免退出后残留正文。
+      if (!canUseCloudWorkspace(authUser)) {
+        persistAnonymousNoteWorkspace(workspace);
+        return;
+      }
 
       if (
         authStatus !== "ready" ||
@@ -941,7 +1020,7 @@ export default function App() {
         isCloudHydrated:
           isLoggedIn && cloudHydratedUserIdRef.current === authUser.id,
         getLatestWorkspace: getCurrentWorkspace,
-        persistLocalWorkspace: persistNoteWorkspace,
+        persistLocalWorkspace: persistAnonymousNoteWorkspace,
         clearPendingCloudSave: () => {
           if (cloudSaveTimeoutRef.current !== null) {
             window.clearTimeout(cloudSaveTimeoutRef.current);
@@ -1495,7 +1574,15 @@ export default function App() {
   async function handleUserAuthenticated(user: AuthUser) {
     setCloudSyncState("syncing");
     setCloudSyncError("");
-    const anonymousWorkspace = getCurrentWorkspace();
+    // 已经在别的账号下直接登录、或当前匿名正文来自旧版迁移时，都不能把
+    // 当前正文当成新账号的初始数据。
+    const canMigrateCurrentWorkspace =
+      (!authUser || authUser.id === user.id) &&
+      !isAnonymousWorkspaceFromLegacy();
+    const initialWorkspace = canMigrateCurrentWorkspace
+      ? getCurrentWorkspace()
+      : getInitialNoteWorkspace();
+    clearLegacyNoteStorage();
 
     try {
       // 密码登录只返回用户对象，appFetch 里缓存的 CSRF 与身份仍是登录前的账号；
@@ -1509,9 +1596,10 @@ export default function App() {
         replaceWorkspace(cloud.workspace);
         cloudRevisionRef.current = cloud.updatedAt ?? 0;
       } else {
-        const stored = await saveCloudWorkspace(anonymousWorkspace);
+        const stored = await saveCloudWorkspace(initialWorkspace);
         cloudRevisionRef.current = stored.updatedAt ?? 0;
         skipNextCloudSaveRef.current = true;
+        replaceWorkspace(initialWorkspace);
       }
 
       cloudHydratedUserIdRef.current = user.id;
@@ -1576,7 +1664,12 @@ export default function App() {
       window.clearTimeout(cloudSaveTimeoutRef.current);
       cloudSaveTimeoutRef.current = null;
     }
+    if (cloudConflictRetryTimeoutRef.current !== null) {
+      window.clearTimeout(cloudConflictRetryTimeoutRef.current);
+      cloudConflictRetryTimeoutRef.current = null;
+    }
 
+    cloudConflictRetryCountRef.current = 0;
     cloudHydratedUserIdRef.current = null;
     cloudRevisionRef.current = 0;
     setAuthUser(null);
@@ -1587,7 +1680,11 @@ export default function App() {
     setIsChangePasswordOpen(false);
     setIsSettingsOpen(false);
     setIsShareOpen(false);
-    replaceWorkspace(getInitialNoteWorkspace());
+    // 退出/会话失效只恢复匿名工作区；旧版全局键不再作为恢复来源。
+    replaceWorkspace(
+      getAnonymousNoteWorkspace({ allowLegacyMigration: false }) ??
+        getInitialNoteWorkspace(),
+    );
     setMobileWorkspaceView("notes");
     writeCurrentNoteRoute(null);
   }
@@ -1905,9 +2002,12 @@ export default function App() {
   }
 
   async function flushPendingCloudSave(): Promise<boolean> {
-    persistNoteWorkspace(getCurrentWorkspace());
+    if (!canUseCloudWorkspace(authUser)) {
+      persistAnonymousNoteWorkspace(getCurrentWorkspace());
+      return true;
+    }
 
-    if (!canUseCloudWorkspace(authUser) || authStatus !== "ready") {
+    if (authStatus !== "ready") {
       return true;
     }
 

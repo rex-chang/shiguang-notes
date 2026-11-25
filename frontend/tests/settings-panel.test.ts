@@ -102,7 +102,7 @@ test("AI 服务可用时才在工具与扩展显示开启选项，并明确逐�
   );
 });
 
-test("每个登录账号可在设置中保存并完整回显自己的公众号配置", () => {
+test("每个登录账号可保存公众号配置，但浏览器不回显 AppSecret", () => {
   const noop = () => undefined;
   const html = renderToStaticMarkup(
     createElement(SettingsPanel, {
@@ -128,7 +128,14 @@ test("每个登录账号可在设置中保存并完整回显自己的公众号�
   assert.match(html, /type="password"/);
   assert.match(html, /aria-label="显示公众号 AppSecret"/);
   assert.match(html, /保存配置/);
-  assert.match(settingsSource, /setWechatAppSecret\(configuration\.appSecret\)/);
+  assert.match(settingsSource, /setWechatAppSecret\(""\)/);
+  assert.match(settingsSource, /hasStoredWechatSecret/);
+  assert.match(settingsSource, /留空保持不变/);
+  assert.match(serverSource, /toPublicWechatConfiguration/);
+  assert.doesNotMatch(
+    serverSource,
+    /response\.json\(\s*configuration\s*\?\?\s*\{/s,
+  );
   assert.match(settingsSource, /value=\{wechatAppSecret\}/);
   assert.match(
     appSource,

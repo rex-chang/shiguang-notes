@@ -77,11 +77,23 @@ test("生产镜像包含归档资源和 Hermes Skill 下载模板", async () => 
   }
 });
 
-test("生产站点通过 HTTPS 路径代理七牛图片", async () => {
+test("前端 Docker 构建上下文包含 fnos 运行依赖", async () => {
+  const [frontendDockerfile, appDockerfile] = await Promise.all([
+    readFile("docker/Dockerfile.frontend", "utf8"),
+    readFile("docker/Dockerfile.app", "utf8"),
+  ]);
+
+  for (const dockerfile of [frontendDockerfile, appDockerfile]) {
+    assert.match(dockerfile, /COPY fnos \.\/fnos/);
+  }
+});
+
+test("生产站点不再同源代理七牛内容，并补齐安全响应头", async () => {
   const nginxConfig = await readFile("docker/nginx/default.conf", "utf8");
 
-  assert.match(
-    nginxConfig,
-    /location \/qiniu\/ \{[^}]*proxy_pass http:\/\/tmp-blog\.fangyuanxiaozhan\.com\/;[^}]*proxy_set_header Host tmp-blog\.fangyuanxiaozhan\.com;/,
-  );
+  assert.doesNotMatch(nginxConfig, /proxy_pass http:\/\/tmp-blog\.fangyuanxiaozhan\.com/);
+  assert.match(nginxConfig, /location \/qiniu\/ \{\s*return 404;\s*\}/);
+  assert.match(nginxConfig, /Content-Security-Policy/);
+  assert.match(nginxConfig, /X-Frame-Options/);
+  assert.match(nginxConfig, /gzip on;/);
 });

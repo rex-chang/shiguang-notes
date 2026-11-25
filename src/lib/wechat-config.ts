@@ -1,7 +1,9 @@
 import { appFetch as fetch } from "./fnos-client.js";
 export interface WechatConfiguration {
   appId: string;
+  /** 服务端不回显明文密钥；空字符串表示保留已保存值。 */
   appSecret: string;
+  hasSecret: boolean;
   updatedAt: number | null;
 }
 

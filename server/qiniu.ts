@@ -479,8 +479,12 @@ export async function uploadImageBufferToQiniu(
   );
   let result: qiniu.httpc.ResponseWrapper;
 
-  // SDK 的 RPC_TIMEOUT 同时覆盖区域查询、连接建立和上传响应等待。
-  qiniu.conf.RPC_TIMEOUT = config.uploadTimeoutMs;
+  // SDK 的 RPC_TIMEOUT 是进程级全局值。并发上传不同配置时只允许调大，
+  // 避免较小超时的请求把另一个大图上传的等待时间截短。
+  qiniu.conf.RPC_TIMEOUT = Math.max(
+    Number(qiniu.conf.RPC_TIMEOUT) || 0,
+    config.uploadTimeoutMs,
+  );
 
   try {
     result = await uploader.put(uploadToken, key, buffer, putExtra);

@@ -2,6 +2,30 @@
 
 本文件记录拾光便签中值得用户关注的变更，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 安全
+
+- 登录账号的正文不再写入浏览器 `localStorage`，匿名工作区改用独立存储键；退出、会话失效和直接换账号不会再恢复或上传上一个账号的内容。旧版全局键在登录时清理，迁移来的旧匿名数据不会自动上传到任何账号。
+- 原生目录授权在系统 API 未就绪时失败关闭；NAS 图片读取强制校验宿主 ACL、符号链接和图片魔数，只能读取 PNG/JPEG/GIF/WebP/BMP，不再能读取任意 ≤32MB 文件。
+- 公众号 AppSecret 不再回显浏览器；设置页留空表示保留已保存密钥。保存公众号配置仍按账号隔离并保持 `no-store`。
+- 非原生部署统一拒绝跨站写请求，移除无必要的通配 CORS；生产 Nginx 补齐 CSP、`X-Frame-Options`、`Referrer-Policy`，并移除已无业务使用的 `/qiniu/` 同源代理。
+- 超级管理员 Cookie 会话加入凭据版本，轮换 `SUPERADMINPASSWORD` 会立即使旧管理员会话失效。
+- 登录输入限制用户名 320 字符、密码 256 字符，失败日志只记录用户名哈希；原生系统凭据写入前先验证可调用宿主 API。
+- 升级 `body-parser`、`multer`、`qs` 到修复 DoS 公告的版本。
+
+### 修复
+
+- 原生模式云端保存遇到 409 时先刷新 revision 并有限重试，不再一次冲突后永久同步失败；轮询只在真正应用云端工作区时推进 revision。
+- 删除账号时同时清理他拥有的共享空间工作区和图片目录。
+- 单篇归档与 PNG 导出限制图片数量和总字节数；ZIP 压缩改为异步并在并发导出/归档/图片导入时限流，避免阻塞事件循环或耗尽内存。
+- 前端 Docker 镜像补齐 `fnos` 源码复制，修复干净环境下 `docker compose build` 与 Docker Hub 发布构建失败。
+
+### 变更
+
+- 原生目录授权与 NAS 图片读取在飞牛系统 API 未就绪时返回 503，设置页继续显示修复提示。
+- 本地构建说明补充 DSH 插件依赖、Playwright Chromium 与构建步骤。
+
 ## [0.9.5] - 2026-10-18
 
 ### 修复
@@ -506,6 +530,7 @@
 [0.9.2]: https://github.com/Alicace/shiguang-notes/releases/tag/v0.9.2
 [0.9.1]: https://github.com/Alicace/shiguang-notes/releases/tag/v0.9.1
 [0.9.0]: https://github.com/Alicace/shiguang-notes/releases/tag/v0.9.0
+[未发布]: https://github.com/zhaoolee/notes/compare/1.12.0...HEAD
 [1.12.0]: https://github.com/zhaoolee/notes/compare/1.11.2...1.12.0
 [1.11.2]: https://github.com/zhaoolee/notes/compare/1.11.1...1.11.2
 [1.11.1]: https://github.com/zhaoolee/notes/compare/1.11.0...1.11.1

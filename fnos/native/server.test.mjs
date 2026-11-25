@@ -212,19 +212,18 @@ test("目录授权刷新后从持久化记录恢复，浏览器不能写入任�
     uid,
     body: { paths: ["/etc"] },
   });
-  assert.equal(
-    await realpath(rejected.data.paths[0]),
-    await realpath(rememberedFolder),
-  );
+  // 没有宿主 ACL 就无法证明新目录属于当前用户，必须失败关闭。
+  assert.equal(rejected.status, 503);
+  assert.match(rejected.data.error, /系统权限接口未就绪/);
   assert.equal((await request("/api/fnos/read-image", {
     method: "POST",
     token,
     uid,
     body: { path: "/etc/passwd" },
-  })).status, 403);
+  })).status, 503);
 });
 
-test("宿主选择器在系统 API 未就绪时可登记真实目录，缺少 Origin 的同源写请求仍由 CSRF 保护", async () => {
+test("系统 API 未就绪时目录授权失败关闭，缺少 Origin 的 CSRF 写保护仍生效", async () => {
   const uid = 1011;
   const token = await session(uid);
   const folder = path.join(directory, "picked-folder");
@@ -245,10 +244,10 @@ test("宿主选择器在系统 API 未就绪时可登记真实目录，缺少 Or
     extra: { "X-Fnnotes-Host-Picker": "1" },
     omitOrigin: true,
   });
-  assert.equal(remembered.status, 200);
-  assert.equal(
-    await realpath(remembered.data.paths[0]),
-    await realpath(imagePath),
+  assert.equal(remembered.status, 503);
+  assert.deepEqual(
+    (await request("/api/authorized-folders", { uid })).data.paths,
+    [],
   );
 
   const image = await request("/api/fnos/read-image", {
@@ -258,8 +257,7 @@ test("宿主选择器在系统 API 未就绪时可登记真实目录，缺少 Or
     body: { path: imagePath },
     omitOrigin: true,
   });
-  assert.equal(image.status, 200);
-  assert.match(image.data.dataUrl, /^data:image\/png;base64,/);
+  assert.equal(image.status, 503);
 
   const space = await request("/api/fnos/spaces", {
     method: "POST",
@@ -481,11 +479,31 @@ test("用户管理：只有 NAS 管理员能建号、停用与删除，独立账
   assert.equal((await request("/api/auth/login", { method: "POST", extra: sameOrigin, body: { username: account.username, password: created.data.initialPassword } })).status, 401);
   assert.equal((await request("/api/auth/login", { method: "POST", extra: sameOrigin, body: { username: account.username, password: reset.data.temporaryPassword } })).status, 200);
 
+  // 独立账号拥有的共享空间也要随删号清理：先建空间、保存正文和图片占位。
+  const relogin = await request("/api/auth/login", { method: "POST", extra: sameOrigin, body: { username: account.username, password: reset.data.temporaryPassword } });
+  assert.equal(relogin.status, 200);
+  const freshCookie = (relogin.headers["set-cookie"] || []).map((value) => value.split(";")[0]).join("; ");
+  const freshTenant = { Cookie: freshCookie, "X-Shiguang-User": account.id };
+  const ownedSpace = await request("/api/fnos/spaces", { method: "POST", token: userToken, extra: freshTenant, body: { name: "删除前共享空间" } });
+  assert.equal(ownedSpace.status, 201);
+  const ownedScope = `space-${ownedSpace.data.id}`;
+  const ownedHeaders = { ...freshTenant, "X-Shiguang-Space": ownedScope };
+  const ownedInitial = await request("/api/workspace", { extra: ownedHeaders });
+  assert.equal(ownedInitial.status, 200);
+  const ownedSaved = await request("/api/workspace", { method: "PUT", token: userToken, extra: ownedHeaders, body: { workspace: workspace("共享空间待清理"), expectedUpdatedAt: ownedInitial.data.updatedAt } });
+  assert.equal(ownedSaved.status, 200);
+  const ownedImageDir = path.join(directory, "images", ownedScope);
+  await mkdir(ownedImageDir, { recursive: true });
+  await writeFile(path.join(ownedImageDir, "orphan.png"), "orphan");
+
   // 飞牛账号不能删除，只能停用；独立账号删除后租户数据一并清掉。
   assert.equal((await request("/api/fnos/users/nas-1002", { uid: 1003, method: "DELETE", token: adminToken })).status, 400);
   assert.equal((await request(`/api/fnos/users/${account.id}`, { uid: 1003, method: "DELETE", token: adminToken })).status, 200);
   assert.ok(!(await request("/api/fnos/users", { uid: 1003 })).data.users.some((item) => item.id === account.id));
   assert.equal((await request("/api/workspace", { extra: asTenant })).data.workspace.notes[0].markdown, privateBefore);
+  const databaseAfterDelete = JSON.parse(await readFile(path.join(directory, "data", "notes-data.json"), "utf8"));
+  assert.equal(Object.hasOwn(databaseAfterDelete.workspaces, ownedScope), false);
+  await assert.rejects(access(ownedImageDir));
 });
 
 test("登录失败连续超过 5 次后按退避拒绝，并返回可读的重试秒数", async () => {

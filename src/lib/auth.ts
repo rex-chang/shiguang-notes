@@ -45,6 +45,22 @@ interface ErrorPayload {
   hint?: string;
 }
 
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+export function isWorkspaceConflictError(
+  error: unknown,
+): error is ApiError {
+  return error instanceof ApiError && error.status === 409;
+}
+
 async function readApiError(
   response: Response,
   fallback: string,
@@ -64,7 +80,10 @@ async function requestJson<T>(
   });
 
   if (!response.ok) {
-    throw new Error(await readApiError(response, fallbackError));
+    throw new ApiError(
+      await readApiError(response, fallbackError),
+      response.status,
+    );
   }
 
   return (await response.json()) as T;
@@ -207,17 +226,35 @@ export function resetHermesSkillInstallLink(): Promise<HermesSkillInstallLink> {
   );
 }
 
-export function getCloudWorkspace(): Promise<CloudWorkspace> {
+let nativeRevision: number | null = null;
+
+interface ReadCloudWorkspaceOptions {
+  /** 轮询未真正应用云端工作区时不要推进版本，否则本地未保存修改会失去并发保护。 */
+  updateRevision?: boolean;
+}
+
+export function updateCloudWorkspaceRevision(
+  updatedAt: number | null,
+): void {
+  nativeRevision = updatedAt;
+}
+
+export function getCloudWorkspace(
+  options: ReadCloudWorkspaceOptions = {},
+): Promise<CloudWorkspace> {
   return requestJson<CloudWorkspace>(
     "/api/workspace",
     undefined,
     "读取云端便签失败。",
-  ).then((stored) => { nativeRevision = stored.updatedAt; return stored; });
+  ).then((stored) => {
+    if (options.updateRevision !== false) {
+      nativeRevision = stored.updatedAt;
+    }
+    return stored;
+  });
 }
 
-let nativeRevision: number | null = null;
-
-export function saveCloudWorkspace(
+function putCloudWorkspace(
   workspace: NoteWorkspace,
 ): Promise<CloudWorkspace> {
   return requestJson<CloudWorkspace>(
@@ -227,10 +264,33 @@ export function saveCloudWorkspace(
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ workspace, ...(isNative ? { expectedUpdatedAt: nativeRevision } : {}) }),
+      body: JSON.stringify({
+        workspace,
+        ...(isNative ? { expectedUpdatedAt: nativeRevision } : {}),
+      }),
     },
     "保存云端便签失败。",
-  ).then((stored) => { nativeRevision = stored.updatedAt; return stored; });
+  ).then((stored) => {
+    nativeRevision = stored.updatedAt;
+    return stored;
+  });
+}
+
+export async function saveCloudWorkspace(
+  workspace: NoteWorkspace,
+): Promise<CloudWorkspace> {
+  try {
+    return await putCloudWorkspace(workspace);
+  } catch (error) {
+    if (!isNative || !isWorkspaceConflictError(error)) {
+      throw error;
+    }
+
+    // 原生模式用 expectedUpdatedAt 防止覆盖并发保存。冲突后先取最新版本，
+    // 再用当前本地快照重试一次；仍然冲突时交给调用方做有限恢复。
+    await getCloudWorkspace();
+    return putCloudWorkspace(workspace);
+  }
 }
 
 export async function listManagedUsers(): Promise<AccountSummary[]> {

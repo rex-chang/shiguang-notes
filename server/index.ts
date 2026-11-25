@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { createDeflate, deflateRawSync, inflateSync } from "node:zlib";
+import { createDeflate, deflateRaw, inflateSync } from "node:zlib";
 import multer, { MulterError } from "multer";
 import type { Browser, Locator, Page } from "playwright";
 import { createElement } from "react";
@@ -67,11 +67,13 @@ import {
   safeStringEqual,
   verifySessionToken,
   verifySkillToken,
+  verifySuperAdminSessionCredential,
   WorkspaceConflictError,
   type AnonymousQuotaStatus,
   type AuthRole,
   type AuthSession,
   type AuthUser,
+  type WechatConfiguration,
 } from "./auth.js";
 import {
   checkAiAvailability,
@@ -271,12 +273,28 @@ class WechatDraftPreparationError extends Error {
   }
 }
 const maxImageSizeBytes = 20 * 1024 * 1024;
+const maxLoginUsernameLength = 320;
+const maxLoginPasswordLength = 256;
 const maxAiMarkdownLength = 100_000;
 const maxAiInstructionLength = 2_000;
 const aiRequestWindowMs = 10 * 60 * 1_000;
 const maxAiRequestsPerWindow = 10;
+const expensiveRequestWindowMs = 10 * 60 * 1_000;
+const exportRequestLimitPerWindow = 30;
+const archiveRequestLimitPerWindow = 30;
+const imageImportLimitPerWindow = 60;
+const workspaceArchiveLimitPerWindow = 10;
+const wechatRequestLimitPerWindow = 30;
+const wechatDraftLimitPerWindow = 20;
 const maxWorkspaceArchiveNotes = 2_000;
 const maxWorkspaceArchiveUncompressedBytes = 512 * 1024 * 1024;
+const maxSingleArchiveImages = 300;
+const maxSingleArchiveImageBytes = 256 * 1024 * 1024;
+const maxExportImages = 200;
+const maxExportInlineBytes = 64 * 1024 * 1024;
+const maxConcurrentExportRequests = 2;
+const maxConcurrentArchiveRequests = 2;
+const maxConcurrentImageImports = 4;
 const maxConcurrentWorkspaceArchiveJobs = 2;
 const maxRetainedWorkspaceArchiveJobs = 8;
 const maxRetainedWorkspaceArchiveBytes = 640 * 1024 * 1024;
@@ -295,8 +313,12 @@ const imageUpload = multer({
 });
 
 let browserPromise: Promise<Browser> | undefined;
+let activeExportRequests = 0;
+let activeArchiveRequests = 0;
+let activeImageImports = 0;
 const activeAiUsers = new Set<string>();
 const aiRequestHistory = new Map<string, number[]>();
+const expensiveRequestHistory = new Map<string, number[]>();
 const workspaceArchiveJobs = new Map<string, WorkspaceArchiveJob>();
 const notesDataStore = new NotesDataStore(dataDirectory);
 const loginThrottle = new LoginThrottle();
@@ -315,6 +337,7 @@ function respondThrottled(response: Response, seconds: number): void {
 }
 const nativeSpaces = new NativeSpaces(path.join(dataDirectory, "shared-spaces.json"));
 const execFileAsync = promisify(execFile);
+const deflateRawAsync = promisify(deflateRaw);
 
 // 飞牛版默认页脚 Logo 会被前端加上应用前缀（/app/fnnotes-m0/...），
 // 判断「是否还是默认 Logo」时必须忽略前缀，否则每篇便签都会被当成自定义图床图片，
@@ -414,8 +437,19 @@ function getRenderUrl(
 }
 
 function getPublicBaseUrl(request: Request): string {
-  const protocol = request.get("x-forwarded-proto") || request.protocol || "http";
-  const host = request.get("x-forwarded-host") || request.get("host");
+  const forwardedProtocol = request.get("x-forwarded-proto")?.split(",")[0]?.trim();
+  const protocol =
+    forwardedProtocol === "https" || forwardedProtocol === "http"
+      ? forwardedProtocol
+      : request.protocol;
+  const host = (request.get("x-forwarded-host") || request.get("host") || "")
+    .split(",")[0]
+    .trim();
+
+  if (!host || !/^[a-z0-9.:[\]_-]+$/i.test(host)) {
+    throw new Error("公开访问地址无效。");
+  }
+
   return `${protocol}://${host}${nativeMode ? nativePrefix : ""}`;
 }
 
@@ -474,19 +508,6 @@ function applyHermesDownloadHeaders(response: Response): void {
   response.setHeader(
     "Content-Disposition",
     'attachment; filename="notes-workspace-api.zip"',
-  );
-}
-
-function applyCorsHeaders(request: Request, response: Response): void {
-  response.setHeader("Access-Control-Allow-Origin", "*");
-  response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS");
-  response.setHeader(
-    "Access-Control-Allow-Headers",
-    request.get("access-control-request-headers") || "Content-Type, Authorization",
-  );
-  response.setHeader(
-    "Access-Control-Expose-Headers",
-    "Content-Disposition, X-Export-Path, X-Export-Url, X-Export-Theme",
   );
 }
 
@@ -551,7 +572,8 @@ async function getAuthenticatedUser(
       safeStringEqual(
         normalizeUsername(session.username),
         normalizeUsername(credentials.username),
-      )
+      ) &&
+      verifySuperAdminSessionCredential(session)
       ? session
       : null;
   }
@@ -698,10 +720,17 @@ function resolveLoginCredentials(body: LoginRequestBody | undefined): {
   remember: boolean;
   username: string;
 } | null {
-  const username = body?.username?.trim();
-  const password = body?.password;
+  const username =
+    typeof body?.username === "string" ? body.username.trim() : "";
+  const password =
+    typeof body?.password === "string" ? body.password : "";
 
-  if (!username || !password) {
+  if (
+    !username ||
+    !password ||
+    username.length > maxLoginUsernameLength ||
+    password.length > maxLoginPasswordLength
+  ) {
     return null;
   }
 
@@ -710,6 +739,11 @@ function resolveLoginCredentials(body: LoginRequestBody | undefined): {
     remember: body?.remember === true,
     username,
   };
+}
+
+// 登录失败日志不写原始邮箱/用户名，避免把 PII 或换行控制字符写入日志。
+function loginLogLabel(value: string): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex").slice(0, 12)}`;
 }
 
 function authenticateSuperAdmin(
@@ -797,6 +831,55 @@ function consumeAiRateLimit(userId: string): number | null {
   history.push(now);
   aiRequestHistory.set(userId, history);
   return null;
+}
+
+function consumeExpensiveRequestBudget(
+  request: Request,
+  limit: number,
+): number | null {
+  const now = Date.now();
+  const earliestAllowed = now - expensiveRequestWindowMs;
+  const key = `${loginClientKey(request)}|${request.method}|${request.path}`;
+  const history = (expensiveRequestHistory.get(key) || []).filter(
+    (timestamp) => timestamp > earliestAllowed,
+  );
+
+  if (history.length >= limit) {
+    expensiveRequestHistory.set(key, history);
+    return Math.max(
+      1,
+      Math.ceil((history[0] + expensiveRequestWindowMs - now) / 1_000),
+    );
+  }
+
+  history.push(now);
+  expensiveRequestHistory.set(key, history);
+
+  if (expensiveRequestHistory.size > 10_000) {
+    for (const [entryKey, timestamps] of expensiveRequestHistory) {
+      if (timestamps.every((timestamp) => timestamp <= earliestAllowed)) {
+        expensiveRequestHistory.delete(entryKey);
+      }
+    }
+  }
+
+  return null;
+}
+
+function rejectExpensiveRequest(
+  request: Request,
+  response: Response,
+  limit: number,
+): boolean {
+  const retryAfter = consumeExpensiveRequestBudget(request, limit);
+
+  if (retryAfter === null) {
+    return false;
+  }
+
+  response.setHeader("Retry-After", String(retryAfter));
+  response.status(429).json({ error: "请求过于频繁，请稍后再试。" });
+  return true;
 }
 
 function normalizeRenderableImageUrls(
@@ -1162,14 +1245,28 @@ async function inlineExternalExportImages(
   markdown: string,
   publicBaseUrl: string,
 ): Promise<string> {
+  const sources = collectMarkdownImageSources(markdown);
+
+  if (sources.length > maxExportImages) {
+    throw new Error(`单次导出最多包含 ${maxExportImages} 张图片。`);
+  }
+
   let output = markdown;
-  for (const source of collectMarkdownImageSources(markdown)) {
+  let inlineBytes = 0;
+
+  for (const source of sources) {
     if (!/^https?:\/\//i.test(source) && !source.startsWith("//")) {
       continue;
     }
     const absoluteSource = source.startsWith("//") ? `https:${source}` : source;
     const image = await resolveArchiveImage(absoluteSource, publicBaseUrl);
     if (!image) continue;
+    inlineBytes += image.buffer.length;
+
+    if (inlineBytes > maxExportInlineBytes) {
+      throw new Error("导出图片总大小超过限制，请拆分便签后再导出。");
+    }
+
     const extension = detectImageFormat(
       image.buffer,
       image.mimeType,
@@ -2408,31 +2505,48 @@ async function buildArchive(
     console.warn("Archive footer Logo skipped", error);
   }
 
-  for (const [index, source] of collectMarkdownImageSources(markdown).entries()) {
+  const imageSources = collectMarkdownImageSources(markdown);
+
+  if (imageSources.length > maxSingleArchiveImages) {
+    throw new Error(`单篇归档最多包含 ${maxSingleArchiveImages} 张图片。`);
+  }
+
+  let archivedImageBytes = 0;
+
+  for (const [index, source] of imageSources.entries()) {
+    let image: ImageSource | null;
+
     try {
-      const image = await resolveArchiveImage(source);
-
-      if (!image?.buffer.length) {
-        continue;
-      }
-
-      const extension = detectImageFormat(image.buffer, image.mimeType, image.filename);
-      const fallbackName = `image-${index + 1}`;
-      const baseFilename = sanitizeArchiveFilename(image.filename || source, fallbackName);
-      const filename = path.extname(baseFilename)
-        ? baseFilename
-        : `${baseFilename}.${extension || "bin"}`;
-      const uniqueFilename = getUniqueArchiveFilename(images, filename);
-
-      images.push({
-        source,
-        filename: uniqueFilename,
-        buffer: image.buffer,
-      });
-      replacements.set(source, `${assetFolderName}/${uniqueFilename}`);
+      image = await resolveArchiveImage(source);
     } catch (error) {
       console.warn(`Archive image skipped: ${source}`, error);
+      continue;
     }
+
+    if (!image?.buffer.length) {
+      continue;
+    }
+
+    archivedImageBytes += image.buffer.length;
+
+    if (archivedImageBytes > maxSingleArchiveImageBytes) {
+      throw new Error("单篇归档图片总大小超过限制，请拆分便签后再归档。");
+    }
+
+    const extension = detectImageFormat(image.buffer, image.mimeType, image.filename);
+    const fallbackName = `image-${index + 1}`;
+    const baseFilename = sanitizeArchiveFilename(image.filename || source, fallbackName);
+    const filename = path.extname(baseFilename)
+      ? baseFilename
+      : `${baseFilename}.${extension || "bin"}`;
+    const uniqueFilename = getUniqueArchiveFilename(images, filename);
+
+    images.push({
+      source,
+      filename: uniqueFilename,
+      buffer: image.buffer,
+    });
+    replacements.set(source, `${assetFolderName}/${uniqueFilename}`);
   }
 
   let archivedMarkdown = markdown;
@@ -2469,7 +2583,7 @@ async function buildArchive(
 
   return {
     filename: `${basename}.zip`,
-    zipBuffer: createZip(entries),
+    zipBuffer: await createZip(entries),
   };
 }
 
@@ -2738,7 +2852,7 @@ async function buildWorkspaceArchive(
 
   return {
     filename: names.filename,
-    zipBuffer: createZip(entries),
+    zipBuffer: await createZip(entries),
   };
 }
 
@@ -2989,7 +3103,7 @@ function getDosDateTime(date: Date): { date: number; time: number } {
   };
 }
 
-function createZip(entries: ZipEntry[]): Buffer {
+async function createZip(entries: ZipEntry[]): Promise<Buffer> {
   const now = getDosDateTime(new Date());
   const localParts: Buffer[] = [];
   const centralParts: Buffer[] = [];
@@ -2997,7 +3111,12 @@ function createZip(entries: ZipEntry[]): Buffer {
 
   for (const entry of entries) {
     const name = Buffer.from(entry.path.replace(/\\/g, "/"), "utf8");
-    const compressed = deflateRawSync(entry.data);
+    // 图片和字体本身已压缩，直接 store 可避免大归档长时间占用 CPU；
+    // 文本、HTML 和 Markdown 继续使用 deflate。
+    const isAlreadyCompressed = /\.(?:png|jpe?g|gif|webp|bmp|svg|woff2?|ttf|otf)$/i.test(entry.path);
+    const compressed = isAlreadyCompressed
+      ? await deflateRawAsync(entry.data, { level: 0 })
+      : await deflateRawAsync(entry.data);
     const checksum = crc32(entry.data);
     const localHeader = Buffer.alloc(30);
 
@@ -3812,6 +3931,22 @@ interface WechatConnectionStatus {
   checkedAt: number | null;
 }
 
+function toPublicWechatConfiguration(
+  configuration: WechatConfiguration | null,
+): {
+  appId: string;
+  appSecret: "";
+  hasSecret: boolean;
+  updatedAt: number | null;
+} {
+  return {
+    appId: configuration?.appId ?? "",
+    appSecret: "",
+    hasSecret: Boolean(configuration?.appSecret),
+    updatedAt: configuration?.updatedAt ?? null,
+  };
+}
+
 async function checkWechatConnection(
   configuration: WechatOfficialConfiguration | null,
   forceRefresh = false,
@@ -4262,8 +4397,6 @@ function isPublicApiRequestWhenLoginRequired(request: Request): boolean {
 }
 
 app.use((request: Request, response: Response, next: NextFunction) => {
-  if (!nativeMode) applyCorsHeaders(request, response);
-
   if (request.method === "OPTIONS") {
     response.sendStatus(204);
     return;
@@ -4276,6 +4409,22 @@ app.use("/api", (_request: Request, response: Response, next: NextFunction) => {
   response.setHeader("Cache-Control", "private, no-store");
   next();
 });
+
+// 非原生部署统一拦截跨站写请求。没有 Origin 的 CLI/Skill 请求保持可用；
+// 原生模式的 Origin 差异由飞牛网关的 CSRF 令牌校验处理。
+if (!nativeMode) {
+  app.use("/api", (request: Request, response: Response, next: NextFunction) => {
+    if (
+      !["GET", "HEAD", "OPTIONS"].includes(request.method) &&
+      !isSameOriginRequest(request)
+    ) {
+      response.status(403).json({ error: "请从当前便签页面发起写操作。" });
+      return;
+    }
+
+    next();
+  });
+}
 
 app.use(async (request: Request, response: Response, next: NextFunction) => {
   if (
@@ -4400,7 +4549,7 @@ app.post(
     if (!superAdmin && !account) {
       const retrySeconds = loginThrottle.recordFailure(throttleKeys);
       console.warn(
-        `[auth] 登录失败 user=${credentials.username} client=${loginClientKey(request)} retryAfter=${retrySeconds}s`,
+        `[auth] 登录失败 user=${loginLogLabel(credentials.username)} client=${loginClientKey(request)} retryAfter=${retrySeconds}s`,
       );
       response.status(401).json({ error: "用户名、邮箱或密码错误。" });
       return;
@@ -4471,7 +4620,7 @@ app.post(
       if (!superAdmin && !account) {
         const retrySeconds = loginThrottle.recordFailure(throttleKeys);
         console.warn(
-          `[auth] Skill Token 凭据失败 user=${credentials.username} client=${loginClientKey(request)} retryAfter=${retrySeconds}s`,
+          `[auth] Skill Token 凭据失败 user=${loginLogLabel(credentials.username)} client=${loginClientKey(request)} retryAfter=${retrySeconds}s`,
         );
         response.status(401).json({ error: "用户名、邮箱或密码错误。" });
         return;
@@ -4677,6 +4826,7 @@ app.post(
     if (
       typeof currentPassword !== "string" ||
       !currentPassword ||
+      currentPassword.length > maxLoginPasswordLength ||
       typeof newPassword !== "string"
     ) {
       response.status(400).json({ error: "请输入当前密码和新密码。" });
@@ -4753,7 +4903,7 @@ app.post(
     if (!user) {
       const retrySeconds = loginThrottle.recordFailure(throttleKeys);
       console.warn(
-        `[auth] 管理员登录失败 user=${credentials.username} client=${loginClientKey(request)} retryAfter=${retrySeconds}s`,
+        `[auth] 管理员登录失败 user=${loginLogLabel(credentials.username)} client=${loginClientKey(request)} retryAfter=${retrySeconds}s`,
       );
       response.status(401).json({ error: "管理员用户名或密码错误。" });
       return;
@@ -4793,13 +4943,7 @@ app.get(
     }
 
     const configuration = await notesDataStore.getWechatConfiguration(user.id);
-    response.json(
-      configuration ?? {
-        appId: "",
-        appSecret: "",
-        updatedAt: null,
-      },
-    );
+    response.json(toPublicWechatConfiguration(configuration));
   },
 );
 
@@ -4852,8 +4996,24 @@ app.put(
     const appId = request.body?.appId;
     const appSecret = request.body?.appSecret;
 
-    if (typeof appId !== "string" || typeof appSecret !== "string") {
+    if (
+      typeof appId !== "string" ||
+      (appSecret !== undefined && typeof appSecret !== "string")
+    ) {
       response.status(400).json({ error: "请输入公众号 AppID 和 AppSecret。" });
+      return;
+    }
+
+    const existingConfiguration =
+      await notesDataStore.getWechatConfiguration(user.id);
+    // 空 AppSecret 表示保留已有密钥，浏览器不再需要保存或回显明文。
+    const resolvedAppSecret =
+      typeof appSecret === "string" && appSecret.trim()
+        ? appSecret
+        : existingConfiguration?.appSecret;
+
+    if (!resolvedAppSecret) {
+      response.status(400).json({ error: "请输入公众号 AppSecret。" });
       return;
     }
 
@@ -4861,11 +5021,11 @@ app.put(
       const configuration = await notesDataStore.saveWechatConfiguration(
         user.id,
         appId,
-        appSecret,
+        resolvedAppSecret,
       );
       clearWechatAccessToken(configuration);
       response.json({
-        ...configuration,
+        ...toPublicWechatConfiguration(configuration),
         ...(await checkWechatConnection(configuration, true)),
       });
     } catch (error) {
@@ -5139,6 +5299,17 @@ app.post(
     request: Request<Record<string, never>, unknown, ExportRequestBody>,
     response: Response,
   ) => {
+    if (rejectExpensiveRequest(request, response, exportRequestLimitPerWindow)) {
+      return;
+    }
+
+    if (activeExportRequests >= maxConcurrentExportRequests) {
+      response.status(429).json({ error: "当前导出任务较多，请稍后再试。" });
+      return;
+    }
+
+    activeExportRequests += 1;
+
     try {
       const body = request.body || {};
       const theme = resolveTheme(body);
@@ -5178,6 +5349,8 @@ app.post(
           ? "Run `npx playwright install chromium` on this machine."
           : undefined,
       });
+    } finally {
+      activeExportRequests -= 1;
     }
   },
 );
@@ -5188,6 +5361,16 @@ app.post(
     request: Request<Record<string, never>, unknown, WorkspaceArchiveRequestBody>,
     response: Response,
   ) => {
+    if (
+      rejectExpensiveRequest(
+        request,
+        response,
+        workspaceArchiveLimitPerWindow,
+      )
+    ) {
+      return;
+    }
+
     pruneWorkspaceArchiveJobs();
     const activeJobCount = Array.from(workspaceArchiveJobs.values()).filter(
       (job) =>
@@ -5304,6 +5487,17 @@ app.post(
     request: Request<Record<string, never>, unknown, ArchiveRequestBody>,
     response: Response,
   ) => {
+    if (rejectExpensiveRequest(request, response, archiveRequestLimitPerWindow)) {
+      return;
+    }
+
+    if (activeArchiveRequests >= maxConcurrentArchiveRequests) {
+      response.status(429).json({ error: "当前归档任务较多，请稍后再试。" });
+      return;
+    }
+
+    activeArchiveRequests += 1;
+
     try {
       const body = request.body || {};
       const theme = resolveTheme(body);
@@ -5325,6 +5519,8 @@ app.post(
       response.status(error instanceof UnsupportedExportThemeError ? 400 : 500).json({
         error: error instanceof Error ? error.message : "Failed to create archive",
       });
+    } finally {
+      activeArchiveRequests -= 1;
     }
   },
 );
@@ -5335,6 +5531,10 @@ app.post(
     request: Request<Record<string, never>, unknown, WechatRequestBody>,
     response: Response,
   ) => {
+    if (rejectExpensiveRequest(request, response, wechatRequestLimitPerWindow)) {
+      return;
+    }
+
     try {
       const body = request.body || {};
       const theme = resolveTheme(body);
@@ -5393,6 +5593,10 @@ app.post(
     const user = await requireNoteServiceUser(request, response);
 
     if (!user) {
+      return;
+    }
+
+    if (rejectExpensiveRequest(request, response, wechatDraftLimitPerWindow)) {
       return;
     }
 
@@ -5506,6 +5710,17 @@ app.post(
     request: Request<Record<string, never>, unknown, ImageImportRequestBody>,
     response: Response,
   ) => {
+    if (rejectExpensiveRequest(request, response, imageImportLimitPerWindow)) {
+      return;
+    }
+
+    if (activeImageImports >= maxConcurrentImageImports) {
+      response.status(429).json({ error: "当前图片导入任务较多，请稍后再试。" });
+      return;
+    }
+
+    activeImageImports += 1;
+
     try {
       await runImageUpload(request, response);
 
@@ -5548,6 +5763,8 @@ app.post(
       response.status(400).json({
         error: message,
       });
+    } finally {
+      activeImageImports -= 1;
     }
   },
 );

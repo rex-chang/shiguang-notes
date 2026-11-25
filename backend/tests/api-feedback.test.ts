@@ -150,7 +150,7 @@ async function stopChild(child: ChildProcess): Promise<void> {
 test("Express 提供健康检查和内容寻址图片存储", async (context) => {
   assert.match(
     await readFile("server/qiniu.ts", "utf8"),
-    /qiniu\.conf\.RPC_TIMEOUT\s*=\s*config\.uploadTimeoutMs/,
+    /qiniu\.conf\.RPC_TIMEOUT\s*=\s*Math\.max\(/,
   );
 
   const port = await getUnusedPort();

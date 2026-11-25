@@ -102,6 +102,7 @@ interface AuthDatabase {
 }
 
 interface SessionPayload extends AuthUser {
+  credentialVersion?: string;
   exp: number;
   passwordVersion?: number;
   remember?: boolean;
@@ -114,6 +115,7 @@ interface SkillTokenPayload extends AuthUser {
 }
 
 export interface AuthSession extends AuthUser {
+  credentialVersion?: string;
   passwordVersion?: number;
   remember: boolean;
 }
@@ -761,6 +763,27 @@ export class NotesDataStore {
     });
   }
 
+  /** 删除账号时一并清理他拥有的共享空间工作区，避免留下无主正文。 */
+  async deleteWorkspaces(scopes: string[]): Promise<void> {
+    const uniqueScopes = new Set(scopes.filter(Boolean));
+
+    return this.runExclusive(async () => {
+      const database = await this.readDatabase();
+      let changed = false;
+
+      for (const scope of uniqueScopes) {
+        if (scope in database.workspaces) {
+          delete database.workspaces[scope];
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        await this.writeDatabase(database);
+      }
+    });
+  }
+
   async authenticateUser(
     username: string,
     password: string,
@@ -1156,8 +1179,13 @@ export function createSessionToken(
   const duration = remember
     ? rememberedSessionDurationSeconds
     : sessionDurationSeconds;
+  const credentialVersion =
+    user.role === "superadmin"
+      ? (getSuperAdminSkillCredentialVersion(user.username) ?? undefined)
+      : undefined;
   const payload: SessionPayload = {
     ...user,
+    credentialVersion,
     exp: Math.floor(now / 1000) + duration,
     passwordVersion,
     remember,
@@ -1210,6 +1238,10 @@ export function verifySessionToken(
     }
 
     return {
+      ...(typeof payload.credentialVersion === "string" &&
+      payload.credentialVersion
+        ? { credentialVersion: payload.credentialVersion }
+        : {}),
       id: payload.id,
       passwordVersion:
         typeof payload.passwordVersion === "number" &&
@@ -1247,6 +1279,19 @@ function getSuperAdminSkillCredentialVersion(username: string): string | null {
       ].join(":"),
     )
     .digest("base64url");
+}
+
+/** 管理员密码轮换后，旧 Cookie 会话必须立即失效。 */
+export function verifySuperAdminSessionCredential(
+  session: Pick<AuthSession, "credentialVersion" | "username">,
+): boolean {
+  const current = getSuperAdminSkillCredentialVersion(session.username);
+
+  return Boolean(
+    current &&
+      session.credentialVersion &&
+      safeStringEqual(session.credentialVersion, current),
+  );
 }
 
 export function createSkillToken(

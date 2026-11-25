@@ -200,7 +200,7 @@ test("superadmin 路由、用户管理和首页云同步入口保持连通", () 
   assert.match(appSource, /CLOUD_POLL_INTERVAL_MS = 15_000/);
   assert.match(
     appSource,
-    /if \(canUseCloudWorkspace\(authUser\)\) \{\s*return;\s*\}[\s\S]*persistNoteWorkspace\(\{\s*activeNoteId,\s*folders,\s*notes: noteDocuments,\s*version: 1,\s*\}\);/s,
+    /if \(canUseCloudWorkspace\(authUser\)\) \{\s*return;\s*\}[\s\S]*persistAnonymousNoteWorkspace\(\{\s*activeNoteId,\s*folders,\s*notes: noteDocuments,\s*version: 1,\s*\}\);/s,
   );
   assert.match(appSource, /canUseCloudWorkspace\(session\)/);
   assert.doesNotMatch(

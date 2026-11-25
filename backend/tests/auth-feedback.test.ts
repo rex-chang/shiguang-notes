@@ -404,6 +404,7 @@ test("管理员可使用便签服务、创建用户且各账号云工作区严�
     assert.deepEqual(await initialWechatConfiguration.json(), {
       appId: "",
       appSecret: "",
+      hasSecret: false,
       updatedAt: null,
     });
 
@@ -443,13 +444,15 @@ test("管理员可使用便签服务、创建用户且各账号云工作区严�
     const savedWechatConfiguration = (await saveWechatConfiguration.json()) as {
       appId: string;
       appSecret: string;
+      hasSecret: boolean;
       configured: boolean;
       connected: boolean;
       connectionError: string | null;
       updatedAt: number;
     };
     assert.equal(savedWechatConfiguration.appId, savedWechatAppId);
-    assert.equal(savedWechatConfiguration.appSecret, savedWechatAppSecret);
+    assert.equal(savedWechatConfiguration.appSecret, "");
+    assert.equal(savedWechatConfiguration.hasSecret, true);
     assert.equal(savedWechatConfiguration.configured, true);
     assert.equal(savedWechatConfiguration.connected, true);
     assert.equal(savedWechatConfiguration.connectionError, null);
@@ -461,9 +464,40 @@ test("管理员可使用便签服务、创建用户且各账号云工作区严�
     );
     assert.deepEqual(await echoedWechatConfiguration.json(), {
       appId: savedWechatAppId,
-      appSecret: savedWechatAppSecret,
+      appSecret: "",
+      hasSecret: true,
       updatedAt: savedWechatConfiguration.updatedAt,
     });
+
+    // 留空 AppSecret 只更新 AppID，保留已保存的密钥并重新连通。
+    const keepSecretConfiguration = await fetch(
+      `${baseUrl}/api/wechat/config`,
+      {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: adminNotesCookie,
+        },
+        body: JSON.stringify({
+          appId: savedWechatAppId,
+          appSecret: "",
+        }),
+      },
+    );
+    assert.equal(keepSecretConfiguration.status, 200);
+    const keptWechatConfiguration =
+      (await keepSecretConfiguration.json()) as {
+        appId: string;
+        appSecret: string;
+        hasSecret: boolean;
+        connected: boolean;
+        updatedAt: number;
+      };
+    assert.equal(keptWechatConfiguration.appId, savedWechatAppId);
+    assert.equal(keptWechatConfiguration.appSecret, "");
+    assert.equal(keptWechatConfiguration.hasSecret, true);
+    assert.equal(keptWechatConfiguration.connected, true);
+    assert.ok(keptWechatConfiguration.updatedAt > savedWechatConfiguration.updatedAt);
 
     const adminWechatStatus = await fetch(`${baseUrl}/api/wechat/status`, {
       headers: { Cookie: adminNotesCookie },
@@ -552,6 +586,7 @@ test("管理员可使用便签服务、创建用户且各账号云工作区严�
     assert.deepEqual(await aliceInitialWechatConfiguration.json(), {
       appId: "",
       appSecret: "",
+      hasSecret: false,
       updatedAt: null,
     });
 
@@ -581,9 +616,11 @@ test("管理员可使用便签服务、创建用户且各账号云工作区严�
       (await aliceEchoedWechatConfiguration.json()) as {
         appId: string;
         appSecret: string;
+        hasSecret: boolean;
       };
     assert.equal(aliceWechatConfiguration.appId, aliceWechatAppId);
-    assert.equal(aliceWechatConfiguration.appSecret, aliceWechatAppSecret);
+    assert.equal(aliceWechatConfiguration.appSecret, "");
+    assert.equal(aliceWechatConfiguration.hasSecret, true);
 
     const aliceDraftResponse = await postJson(
       baseUrl,
@@ -875,8 +912,9 @@ test("管理员可使用便签服务、创建用户且各账号云工作区严�
     );
     assert.deepEqual(await adminWechatConfigurationAfterAliceSave.json(), {
       appId: savedWechatAppId,
-      appSecret: savedWechatAppSecret,
-      updatedAt: savedWechatConfiguration.updatedAt,
+      appSecret: "",
+      hasSecret: true,
+      updatedAt: keptWechatConfiguration.updatedAt,
     });
 
     const aliceWorkspace = createWorkspace("alice-private", 1_000);

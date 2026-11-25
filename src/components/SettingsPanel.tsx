@@ -121,6 +121,7 @@ export function SettingsPanel({
   const [footerLogoError, setFooterLogoError] = useState("");
   const [wechatAppId, setWechatAppId] = useState("");
   const [wechatAppSecret, setWechatAppSecret] = useState("");
+  const [hasStoredWechatSecret, setHasStoredWechatSecret] = useState(false);
   const [wechatConfigurationError, setWechatConfigurationError] = useState("");
   const [wechatConfigurationState, setWechatConfigurationState] = useState<
     "idle" | "loading" | "ready" | "saving" | "saved"
@@ -189,10 +190,14 @@ export function SettingsPanel({
           return;
         }
 
+        const hasStoredSecret =
+          configuration.hasSecret || Boolean(configuration.appSecret);
         setWechatAppId(configuration.appId);
-        setWechatAppSecret(configuration.appSecret);
+        // 服务端不再回显明文密钥；只有用户输入新值时才会替换。
+        setWechatAppSecret("");
+        setHasStoredWechatSecret(hasStoredSecret);
 
-        if (configuration.appId && configuration.appSecret) {
+        if (configuration.appId && hasStoredSecret) {
           setWechatConnectionState("checking");
 
           try {
@@ -247,7 +252,10 @@ export function SettingsPanel({
         wechatAppSecret,
       );
       setWechatAppId(configuration.appId);
-      setWechatAppSecret(configuration.appSecret);
+      setWechatAppSecret("");
+      setHasStoredWechatSecret(
+        Boolean(configuration.hasSecret || configuration.appSecret),
+      );
       setWechatConnectionState(
         configuration.connected ? "connected" : "failed",
       );
@@ -747,7 +755,11 @@ export function SettingsPanel({
                         <input
                           type={isWechatAppSecretVisible ? "text" : "password"}
                           value={wechatAppSecret}
-                          placeholder="请输入 32 位 AppSecret"
+                          placeholder={
+                            hasStoredWechatSecret
+                              ? "已保存，留空保持不变"
+                              : "请输入 32 位 AppSecret"
+                          }
                           aria-label="公众号 AppSecret"
                           autoComplete="off"
                           spellCheck={false}
@@ -809,7 +821,8 @@ export function SettingsPanel({
                           wechatConfigurationState === "loading" ||
                           wechatConfigurationState === "saving" ||
                           !wechatAppId.trim() ||
-                          !wechatAppSecret.trim()
+                          (!wechatAppSecret.trim() &&
+                            !hasStoredWechatSecret)
                         }
                       >
                         {wechatConfigurationState === "loading"

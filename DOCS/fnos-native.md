@@ -68,8 +68,8 @@ Skill/DSH 的应用 Token 不能替代飞牛网关登录态。客户端配置自
 
 - **用户管理与租户隔离**：`GET/POST /api/fnos/users`、`PATCH/DELETE /api/fnos/users/:id`（仅 `X-Trim-Isadmin: true` 可调用）。飞牛账号沿用 `nas-<uid>`，独立账号用随机 id；工作区、图片目录（`images/<scope>`）、归档任务都按账号 id 隔离，删号会一并清掉该租户的便签、图片与他拥有的共享空间。共享空间成员既可按 NAS UID 邀请（允许先邀请后启用），也可按账号 id 精确指定。
 - **独立账号登录**：网关中间件只对「飞牛托管账号」强制身份一致（`nas-<uid>` 必须等于当前网关 UID），应用自建账号作为独立租户可以在自己的会话下使用；被停用账号的请求一律 403，已签发的 Cookie 与 Skill Token 同时作废。
-- **防爆破**：`server/security/login-throttle.ts` 按「账号 + 来源」双桶计数，5 次失败后 5/10/20/40/60 分钟退避，登录与 Skill Token 凭据通道共用；失败写 `app.log`（只有用户名与来源）。
-- **目录授权**：系统 API 凭据改为「环境变量 `TRIM_API_TOKEN` → 应用数据目录 `api-token` 文件」两级读取，启动时在日志里说明是否就绪；凭据缺失时 `/api/authorized-folders` 返回 `{configured:false,paths:[]}`（不再是 503），设置页显示警告与修复步骤，`/api/file-acl` 明确提示未就绪，打开面板自动刷新授权目录。
+- **防爆破**：`server/security/login-throttle.ts` 按「账号 + 来源」双桶计数，5 次失败后 5/10/20/40/60 分钟退避，登录与 Skill Token 凭据通道共用；登录输入限制用户名 320 字符、密码 256 字符，失败写 `app.log`（只有用户名哈希与来源）。
+- **目录授权**：系统 API 凭据改为「环境变量 `TRIM_API_TOKEN` → 应用数据目录 `api-token` 文件」两级读取，启动时在日志里说明是否就绪；凭据缺失时 `GET /api/authorized-folders` 返回 `{configured:false,paths:[]}`，设置页显示警告与修复步骤，`/api/file-acl` 明确提示未就绪，打开面板自动刷新授权目录。新增目录授权（`POST /api/authorized-folders`）与 NAS 图片读取在凭据缺失时失败关闭并返回 503；不再仅凭 `X-Fnnotes-Host-Picker` 头写入任意可读目录。读取时校验宿主 ACL、`O_NOFOLLOW` 与图片魔数，只接受 PNG/JPEG/GIF/WebP/BMP。
 - **修复**：密码登录后编辑内容静默不保存（登录后先刷新会话再拉工作区）；独立账号首次进入没有便签（租户首访播种空白便签，旧 M0 正文继续导入）；便签含图片时正文被拆成多段导致检查脚本超时。
 
 验证：前端 195 项、后端 16 项、DSH 17 项、原生 13 项、辅助 7 项；浏览器检查 `ui-`、`shared-`、`assets-`、`startup-`、新增的 `users-browser-check.js`（建号 → 一次性密码 → 独立账号登录与租户隔离 → 重置密码 → 停用/启用 → 删除，以及目录授权按钮反馈）与完整 `browser-check.js` 全部在真实浏览器里通过。

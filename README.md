@@ -136,6 +136,9 @@
 
 ```bash
 npm ci
+npm --prefix dsh-plugin ci
+npx playwright install chromium
+npm run build
 npm test
 npm run fnos:build
 npm run fnos:pack

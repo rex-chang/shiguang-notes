@@ -7,6 +7,7 @@ RUN npm ci
 
 COPY CHANGELOG.md index.html tsconfig.json vite.config.ts ./
 COPY src ./src
+COPY fnos ./fnos
 COPY example ./example
 COPY public ./public
 

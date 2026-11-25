@@ -36,8 +36,14 @@ export {
 } from "./footer";
 
 export const FALLBACK_CONTENT = "";
-export const DRAFT_STORAGE_KEY = "notes.markdownDraft";
-export const WORKSPACE_STORAGE_KEY = "notes.workspace.v1";
+// 匿名工作区与登录账号的正文分开存放。登录态绝不写入这两个键，避免退出或换账号后
+// 把上一个账号的正文留给下一个用户，甚至被当成新账号的初始工作区上传。
+const ANONYMOUS_WORKSPACE_STORAGE_KEY = "notes.anonymous.workspace.v1";
+const ANONYMOUS_ORIGIN_STORAGE_KEY = "notes.anonymous.workspace.origin.v1";
+const LEGACY_ANONYMOUS_ORIGIN = "legacy";
+const LEGACY_WORKSPACE_STORAGE_KEY = "notes.workspace.v1";
+const LEGACY_DRAFT_STORAGE_KEY = "notes.markdownDraft";
+let anonymousWorkspaceCameFromLegacy = false;
 export const AI_ENABLED_STORAGE_KEY = "notes.aiEnabled";
 export const SAMPLE_MARKDOWN_CONTENT = sampleMarkdown || FALLBACK_CONTENT;
 
@@ -56,7 +62,7 @@ export function isSmartisanWebTestDataMode(): boolean {
 function getWorkspaceStorageKey(): string {
   return isSmartisanWebTestDataMode()
     ? SMARTISAN_WEB_TEST_WORKSPACE_STORAGE_KEY
-    : WORKSPACE_STORAGE_KEY;
+    : ANONYMOUS_WORKSPACE_STORAGE_KEY;
 }
 
 function readStoredValue(key: string): string | null {
@@ -64,7 +70,46 @@ function readStoredValue(key: string): string | null {
     return null;
   }
 
-  return window.localStorage.getItem(key);
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredValue(key: string, value: string): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // 浏览器禁用存储或配额不足时不能阻断编辑；云端保存仍是登录账号的兜底。
+  }
+}
+
+function removeStoredValue(key: string): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.removeItem(key);
+  } catch {
+    // 与写入一致：存储不可用时静默降级。
+  }
+}
+
+function createWorkspaceFromMarkdown(markdown: string): NoteWorkspace {
+  const note = createNoteDocument(markdown);
+
+  return {
+    activeNoteId: note.id,
+    folders: [],
+    notes: [note],
+    version: 1,
+  };
 }
 
 function readSearchParam(key: string): string | null {
@@ -75,62 +120,139 @@ function readSearchParam(key: string): string | null {
   return new URLSearchParams(window.location.search).get(key);
 }
 
+/**
+ * 启动时的占位工作区。普通网页不再在会话确认前读取本地正文，避免共享设备上
+ * 登录账号的旧内容在云端水合完成前闪现；匿名正文由 getAnonymousNoteWorkspace()
+ * 在确认无登录会话后加载。
+ */
 export function getInitialNoteWorkspace(): NoteWorkspace {
   if (isNative) {
-    const note = createNoteDocument("");
-    return { activeNoteId: note.id, folders: [], notes: [note], version: 1 };
+    return createWorkspaceFromMarkdown("");
   }
   if (getRenderMode() === "playwright") {
-    const note = createNoteDocument(FALLBACK_CONTENT);
-    return {
-      activeNoteId: note.id,
-      folders: [],
-      notes: [note],
-      version: 1,
-    };
-  }
-
-  const shouldResetTestData =
-    isSmartisanWebTestDataMode() && readSearchParam("resetTestData") === "1";
-
-  if (shouldResetTestData) {
-    consumeTestDataResetFromCurrentUrl();
-  }
-
-  const storedWorkspace = shouldResetTestData
-    ? null
-    : parseNoteWorkspace(readStoredValue(getWorkspaceStorageKey()));
-
-  if (storedWorkspace) {
-    return storedWorkspace;
+    return createWorkspaceFromMarkdown(FALLBACK_CONTENT);
   }
 
   if (isSmartisanWebTestDataMode()) {
-    return createSmartisanWebTestWorkspace();
+    const shouldResetTestData = readSearchParam("resetTestData") === "1";
+
+    if (shouldResetTestData) {
+      consumeTestDataResetFromCurrentUrl();
+    }
+
+    const storedWorkspace = shouldResetTestData
+      ? null
+      : parseNoteWorkspace(readStoredValue(getWorkspaceStorageKey()));
+
+    return storedWorkspace ?? createSmartisanWebTestWorkspace();
   }
 
-  const storedDraft = readStoredValue(DRAFT_STORAGE_KEY);
-  const note = createNoteDocument(storedDraft ?? SAMPLE_MARKDOWN_CONTENT);
-
-  return {
-    activeNoteId: note.id,
-    folders: [],
-    notes: [note],
-    version: 1,
-  };
+  return createWorkspaceFromMarkdown(SAMPLE_MARKDOWN_CONTENT);
 }
 
-export function persistNoteWorkspace(workspace: NoteWorkspace): void {
-  if (typeof window === "undefined" || getRenderMode() === "playwright") {
+interface AnonymousWorkspaceOptions {
+  /** 登录态下不要迁移旧版全局键，避免把旧版本遗留的账号正文当成匿名数据。 */
+  allowLegacyMigration?: boolean;
+}
+
+/**
+ * 读取仅属于匿名模式的工作区。旧版 `notes.workspace.v1` 只在匿名启动时迁移一次；
+ * 登录账号的云端水合路径使用 allowLegacyMigration: false 并清理旧键。
+ */
+export function getAnonymousNoteWorkspace(
+  options: AnonymousWorkspaceOptions = {},
+): NoteWorkspace | null {
+  if (
+    typeof window === "undefined" ||
+    isNative ||
+    getRenderMode() === "playwright" ||
+    isSmartisanWebTestDataMode()
+  ) {
+    return null;
+  }
+
+  const storedWorkspace = parseNoteWorkspace(
+    readStoredValue(ANONYMOUS_WORKSPACE_STORAGE_KEY),
+  );
+
+  if (storedWorkspace) {
+    anonymousWorkspaceCameFromLegacy =
+      readStoredValue(ANONYMOUS_ORIGIN_STORAGE_KEY) === LEGACY_ANONYMOUS_ORIGIN;
+    return storedWorkspace;
+  }
+
+  if (options.allowLegacyMigration === false) {
+    return null;
+  }
+
+  const legacyWorkspace = parseNoteWorkspace(
+    readStoredValue(LEGACY_WORKSPACE_STORAGE_KEY),
+  );
+
+  if (legacyWorkspace) {
+    writeStoredValue(
+      ANONYMOUS_WORKSPACE_STORAGE_KEY,
+      JSON.stringify(legacyWorkspace),
+    );
+    writeStoredValue(ANONYMOUS_ORIGIN_STORAGE_KEY, LEGACY_ANONYMOUS_ORIGIN);
+    anonymousWorkspaceCameFromLegacy = true;
+    removeStoredValue(LEGACY_WORKSPACE_STORAGE_KEY);
+    removeStoredValue(LEGACY_DRAFT_STORAGE_KEY);
+    return legacyWorkspace;
+  }
+
+  const legacyDraft = readStoredValue(LEGACY_DRAFT_STORAGE_KEY);
+
+  if (!legacyDraft) {
+    return null;
+  }
+
+  const migratedWorkspace = createWorkspaceFromMarkdown(legacyDraft);
+  writeStoredValue(
+    ANONYMOUS_WORKSPACE_STORAGE_KEY,
+    JSON.stringify(migratedWorkspace),
+  );
+  writeStoredValue(ANONYMOUS_ORIGIN_STORAGE_KEY, LEGACY_ANONYMOUS_ORIGIN);
+  anonymousWorkspaceCameFromLegacy = true;
+  removeStoredValue(LEGACY_WORKSPACE_STORAGE_KEY);
+  removeStoredValue(LEGACY_DRAFT_STORAGE_KEY);
+  return migratedWorkspace;
+}
+
+/** 旧版迁移来的匿名正文不能自动上传到新账号，避免把上一个账号的内容带过去。 */
+export function isAnonymousWorkspaceFromLegacy(): boolean {
+  return (
+    anonymousWorkspaceCameFromLegacy ||
+    readStoredValue(ANONYMOUS_ORIGIN_STORAGE_KEY) === LEGACY_ANONYMOUS_ORIGIN
+  );
+}
+
+/** 只允许匿名工作区调用；登录账号必须只依赖服务端工作区。 */
+export function persistAnonymousNoteWorkspace(workspace: NoteWorkspace): void {
+  if (
+    typeof window === "undefined" ||
+    isNative ||
+    getRenderMode() === "playwright"
+  ) {
     return;
   }
 
-  window.localStorage.setItem(getWorkspaceStorageKey(), JSON.stringify(workspace));
+  writeStoredValue(getWorkspaceStorageKey(), JSON.stringify(workspace));
 
-  const activeNote = workspace.notes.find((note) => note.id === workspace.activeNoteId);
-  if (activeNote && !isSmartisanWebTestDataMode()) {
-    window.localStorage.setItem(DRAFT_STORAGE_KEY, activeNote.markdown);
+  if (!isSmartisanWebTestDataMode()) {
+    removeStoredValue(LEGACY_WORKSPACE_STORAGE_KEY);
+    removeStoredValue(LEGACY_DRAFT_STORAGE_KEY);
   }
+}
+
+/** 登录成功后清理旧版本的全局正文键；匿名正文另有独立键，不受影响。 */
+export function clearLegacyNoteStorage(): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  removeStoredValue(LEGACY_WORKSPACE_STORAGE_KEY);
+  removeStoredValue(LEGACY_DRAFT_STORAGE_KEY);
 }
 
 export function getRenderMode(): string | null {

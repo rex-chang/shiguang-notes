@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import fs from "node:fs/promises";
+import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import type { Express, NextFunction, Request, Response } from "express";
 import type { AuthSession, NotesDataStore } from "./auth.js";
@@ -31,6 +31,7 @@ import metadata from "../src/native/metadata.json" with { type: "json" };
 export const nativeMode = process.env.FNOS_NATIVE === "1";
 export const nativePrefix = "/app/fnnotes-m0";
 export const nativeVersion = metadata.appVersion;
+const maxNasImageBytes = 32 * 1024 * 1024;
 export interface SharedSpace { id: string; name: string; ownerId: string; members: Record<string, "editor" | "viewer">; createdAt: number }
 interface NativeContext { user: AuthSession; uid: number; isAdmin: boolean; scope: string; writable: boolean }
 export const nativeContext = new AsyncLocalStorage<NativeContext>();
@@ -232,9 +233,21 @@ export function installNativeRoutes(app: Express, spaces: NativeSpaces, store: N
     if (account.kind === "nas") { response.status(400).json({ error: "飞牛账号由 NAS 管理，如需禁止使用请选择停用。" }); return; }
     if (id === nativeContext.getStore()!.user.id) { response.status(400).json({ error: "不能删除当前登录的账号。" }); return; }
     // 连同租户数据一起清掉：工作区、图片、以及他拥有的共享空间。
-    await spaces.mutate((items) => items.filter((space) => space.ownerId !== id).map((space) => { delete space.members[id]; return space; }));
+    const ownedSpaceIds: string[] = [];
+    await spaces.mutate((items) => {
+      for (const space of items) {
+        if (space.ownerId === id) ownedSpaceIds.push(space.id);
+      }
+      return items.filter((space) => space.ownerId !== id).map((space) => { delete space.members[id]; return space; });
+    });
+    await store.deleteWorkspaces(ownedSpaceIds.map((spaceId) => `space-${spaceId}`));
     const removed = await store.deleteAccount(id);
-    if (imagesDir) await fs.rm(path.join(imagesDir, id), { force: true, recursive: true }).catch(() => undefined);
+    if (imagesDir) {
+      await fs.rm(path.join(imagesDir, id), { force: true, recursive: true }).catch(() => undefined);
+      await Promise.all(ownedSpaceIds.map((spaceId) =>
+        fs.rm(path.join(imagesDir, `space-${spaceId}`), { force: true, recursive: true }).catch(() => undefined),
+      ));
+    }
     response.json({ user: removed });
   });
 
@@ -485,6 +498,17 @@ export function installNativeRoutes(app: Express, spaces: NativeSpaces, store: N
       return;
     }
 
+    // 先验证候选凭据确实能调用宿主系统 API，避免任意登录用户用无效字符串
+    // 覆盖全局 api-token 并让所有人的目录授权失效。
+    try {
+      await systemApiWithToken(secret, "trim.file.getUserAccessibleFolders", {
+        uid: nativeContext.getStore()!.uid,
+      });
+    } catch {
+      response.status(400).json({ error: "系统凭据无效或无法完成验证。" });
+      return;
+    }
+
     const filename = path.join(process.env.TRIM_PKGVAR!, "api-token");
     const temporary = filename + "." + randomBytes(6).toString("hex") + ".tmp";
     try {
@@ -599,13 +623,17 @@ export function installNativeRoutes(app: Express, spaces: NativeSpaces, store: N
     const remembered = (await readAuthorizedFolders())[userId] || [];
     const normalizedRemembered = (await Promise.all(remembered.map(normalizeAuthorizedPath)))
       .filter((item): item is string => Boolean(item));
-    // Once the host API is available, its ACL is authoritative. A stale
-    // remembered path must not keep working after the user loses access.
     if (!(await systemApiToken())) return normalizedRemembered;
     const live = await loadLiveAuthorizedFolders();
-    return live.healthy
-      ? Array.from(new Set([...live.paths, ...normalizedRemembered]))
-      : normalizedRemembered;
+    if (!live.healthy) return normalizedRemembered;
+    // 宿主 ACL 可用时以实时授权为准：历史路径只有在仍位于实时授权目录内
+    // 才继续有效，避免撤销授权后旧记录继续读取。
+    const normalizedLive = (await Promise.all(live.paths.map(normalizeAuthorizedPath)))
+      .filter((item): item is string => Boolean(item));
+    const stillAuthorized = normalizedRemembered.filter((candidate) =>
+      normalizedLive.some((root) => isPathInside(root, candidate)),
+    );
+    return Array.from(new Set([...normalizedLive, ...stillAuthorized]));
   };
   const isPathInside = (root: string, candidate: string): boolean => {
     const relative = path.relative(root, candidate);
@@ -624,6 +652,12 @@ export function installNativeRoutes(app: Express, spaces: NativeSpaces, store: N
   // 记录本次宿主选择器确认过的目录；系统 API 可用时再按实时授权列表复核。
   app.post("/api/authorized-folders", async (request, response) => {
     const userId = nativeContext.getStore()!.user.id;
+    // 没有宿主 ACL 时无法证明选择器返回的目录属于当前用户；此时宁可不授权，
+    // 也不能仅凭客户端声明就把任意可读目录写进授权表。
+    if (!(await systemApiToken())) {
+      response.status(503).json({ error: "飞牛系统权限接口未就绪，暂时不能新增目录授权。" });
+      return;
+    }
     const input = request.body?.paths;
     const candidates = Array.isArray(input)
       ? input.filter((item: unknown): item is string => typeof item === "string" && item.startsWith("/") && !item.includes("\0") && item.length <= 4096).slice(0, 64)
@@ -642,30 +676,13 @@ export function installNativeRoutes(app: Express, spaces: NativeSpaces, store: N
         continue;
       }
       if (!hostPicker) continue;
-      // A selected path may not appear in the host's folder list yet. If the
-      // host API is available, verify the exact file/folder ACL before saving.
-      if (!(await systemApiToken())) {
-        verified.push(candidate);
-        continue;
-      }
+      // 选择器返回的路径可能还不在宿主目录列表里，必须逐个校验用户 ACL。
       try {
         const permissions = await systemApi("trim.file.checkUserACL", {
           uid: nativeContext.getStore()!.uid,
           path: candidate,
         });
-        const list = Array.isArray(permissions)
-          ? permissions
-          : permissions && typeof permissions === "object"
-            ? (permissions as { permissions?: unknown }).permissions
-            : null;
-        const readable = (Array.isArray(list) && list.some(
-          (item) => item && typeof item === "object" &&
-            (item as { readable?: unknown }).readable === true,
-        )) || Boolean(
-          permissions && typeof permissions === "object" &&
-            (permissions as { readable?: unknown }).readable === true,
-        );
-        if (readable) verified.push(candidate);
+        if (hasReadablePermission(permissions)) verified.push(candidate);
       } catch {
         // Fail closed when the host API cannot verify the selected path.
       }
@@ -686,6 +703,12 @@ export function installNativeRoutes(app: Express, spaces: NativeSpaces, store: N
     }
 
     const userId = nativeContext.getStore()!.user.id;
+
+    if (!(await systemApiToken())) {
+      response.status(503).json({ error: "飞牛系统权限接口未就绪，暂时不能读取 NAS 图片。" });
+      return;
+    }
+
     const allowedRoots = await loadAuthorizedRoots(userId);
     let requestedPath: string;
     try { requestedPath = await fs.realpath(path.resolve(value)); }
@@ -702,51 +725,60 @@ export function installNativeRoutes(app: Express, spaces: NativeSpaces, store: N
       return;
     }
 
+    let permissions: unknown;
     try {
-      if (await systemApiToken()) {
-        let permissions: unknown;
-        try {
-          permissions = await systemApi("trim.file.checkUserACL", {
-            uid: nativeContext.getStore()!.uid,
-            path: requestedPath,
-          });
-        } catch {
-          response.status(503).json({ error: "飞牛文件 ACL 检查暂不可用，请稍后重试。" });
-          return;
-        }
-        const permissionList = Array.isArray(permissions)
-          ? permissions
-          : permissions && typeof permissions === "object"
-            ? (permissions as { permissions?: unknown }).permissions
-            : null;
-        const readable =
-          (Array.isArray(permissionList) &&
-            permissionList.some(
-              (item) => item && typeof item === "object" &&
-                (item as { readable?: unknown }).readable === true,
-            )) ||
-          Boolean(
-              permissions && typeof permissions === "object" &&
-                (permissions as { readable?: unknown }).readable === true,
-          );
-        if (!readable) {
-          response.status(403).json({ error: "当前用户没有读取该文件的权限。" });
-          return;
-        }
-      }
-      const stat = await fs.stat(requestedPath);
-      if (!stat.isFile() || stat.size > 32 * 1024 * 1024) {
-        response.status(400).json({ error: "只能读取 32MB 以内的图片文件。" });
+      permissions = await systemApi("trim.file.checkUserACL", {
+        uid: nativeContext.getStore()!.uid,
+        path: requestedPath,
+      });
+    } catch {
+      response.status(503).json({ error: "飞牛文件 ACL 检查暂不可用，请稍后重试。" });
+      return;
+    }
+    if (!hasReadablePermission(permissions)) {
+      response.status(403).json({ error: "当前用户没有读取该文件的权限。" });
+      return;
+    }
+
+    let handle: FileHandle;
+    try {
+      // realpath 后再用 O_NOFOLLOW 打开，避免检查后路径被替换成符号链接。
+      handle = await fs.open(requestedPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    } catch {
+      response.status(404).json({ error: "图片文件不存在或无法读取。" });
+      return;
+    }
+
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size > maxNasImageBytes) {
+        response.status(400).json({
+          error: `只能读取 ${Math.floor(maxNasImageBytes / 1024 / 1024)}MB 以内的图片文件。`,
+        });
         return;
       }
 
-      const buffer = await fs.readFile(requestedPath);
+      const buffer = await handle.readFile();
+      if (buffer.length > maxNasImageBytes) {
+        response.status(400).json({
+          error: `只能读取 ${Math.floor(maxNasImageBytes / 1024 / 1024)}MB 以内的图片文件。`,
+        });
+        return;
+      }
+      const mimeType = detectImageMimeType(buffer);
+      if (!mimeType) {
+        response.status(400).json({ error: "只能读取 PNG、JPEG、GIF、WebP 或 BMP 图片。" });
+        return;
+      }
+
       response.json({
-        dataUrl: `data:${detectImageMimeType(buffer, requestedPath)};base64,${buffer.toString("base64")}`,
+        dataUrl: `data:${mimeType};base64,${buffer.toString("base64")}`,
         filename: path.basename(requestedPath),
       });
     } catch {
       response.status(404).json({ error: "读取图片失败，请确认文件仍然存在。" });
+    } finally {
+      await handle.close().catch(() => undefined);
     }
   });
 
@@ -792,24 +824,42 @@ async function systemApiToken(): Promise<string | null> {
   }
 }
 
-// 只按文件头判断常见图片类型；无法识别时退回 application/octet-stream。
-function detectImageMimeType(buffer: Buffer, filename: string): string {
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function hasReadablePermission(permissions: unknown): boolean {
+  if (isObjectRecord(permissions) && permissions.readable === true) {
+    return true;
+  }
+
+  const list = Array.isArray(permissions)
+    ? permissions
+    : isObjectRecord(permissions) && Array.isArray(permissions.permissions)
+      ? permissions.permissions
+      : null;
+
+  return (
+    Array.isArray(list) &&
+    list.some((item) => isObjectRecord(item) && item.readable === true)
+  );
+}
+
+// 只按文件头判断图片类型；不再用扩展名兜底，避免把任意文件伪装成图片读出。
+function detectImageMimeType(buffer: Buffer): string | null {
   if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
   if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "image/jpeg";
   if (buffer.length >= 6 && buffer.subarray(0, 6).toString("ascii").match(/^GIF8[79]a$/)) return "image/gif";
   if (buffer.length >= 12 && buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
   if (buffer.length >= 2 && buffer.subarray(0, 2).toString("ascii") === "BM") return "image/bmp";
-  const lower = filename.toLowerCase();
-  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
-  if (lower.endsWith(".png")) return "image/png";
-  if (lower.endsWith(".gif")) return "image/gif";
-  if (lower.endsWith(".webp")) return "image/webp";
-  return "application/octet-stream";
+  return null;
 }
 
-async function systemApi(reqName: string, data: object): Promise<unknown> {
-  const token = await systemApiToken();
-  if (!token) throw new Error("系统凭据未配置");
+function systemApiWithToken(
+  token: string,
+  reqName: string,
+  data: object,
+): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const request = http.request({ socketPath: "/var/run/trim_open_gateway_apiscope.socket", path: "/api/v1/trimapp", method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` } }, (response) => {
       const chunks: Buffer[] = []; let size = 0;
@@ -820,4 +870,10 @@ async function systemApi(reqName: string, data: object): Promise<unknown> {
     request.setTimeout(5000, () => request.destroy()); request.on("error", reject);
     request.end(JSON.stringify({ reqId: randomBytes(8).toString("hex"), req: reqName, appName: "fnnotes-m0", data }));
   });
+}
+
+async function systemApi(reqName: string, data: object): Promise<unknown> {
+  const token = await systemApiToken();
+  if (!token) throw new Error("系统凭据未配置");
+  return systemApiWithToken(token, reqName, data);
 }
