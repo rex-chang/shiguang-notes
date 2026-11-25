@@ -13,10 +13,20 @@
 - 保留 `fnnotes-m0` 包标识和 `/app/fnnotes-m0/` 前缀以便升级；展示名称为拾光便签。
 - `VITE_FNOS_NATIVE=1`：构建完整前端，适配路径、客户端 PNG、共享空间与原生设置。普通构建保留上游模式以运行其回归测试。
 - `fnos/native/main.mjs`：校验目录与非 root 用户，载入本机受保护的服务配置与签名密钥，再启动完整应用。
-- `fnos/native/build.mjs`：编译、复制完整界面和服务、字体/许可证/Skill，携带 Linux x64/glibc 的 Node 生产依赖，生成 FPK。无 Docker、Chromium 或生产 Playwright 依赖。
+- `fnos/native/build.mjs`：编译、复制完整界面和服务、字体/许可证/Skill，携带 Linux glibc 的 Node 生产依赖，生成 FPK。无 Docker、Chromium 或生产 Playwright 依赖。`FNOS_TARGET_ARCH=arm64` 生成 `platform=arm`、`_arm64.fpk`；默认仍为 x86_64。
 - `fnos/native/dev.mjs`：开发机模拟网关，1001/1002/1003 对应三个固定测试入口；不进入包。
 
-构建命令：`npm run fnos:build`；打包：`npm run fnos:pack`。开发机必须先准备 `.tools/native-runtime-linux` 的生产依赖；可用 `FNOS_RUNTIME_DIR` 指定。只复制实际安装的 Linux x64 运行依赖，不能用 macOS Sharp 交付 NAS。
+构建命令：`npm run fnos:build`；打包：`npm run fnos:pack`。x86_64 使用 `.tools/native-runtime-linux`，arm64 使用
+`.tools/native-runtime-linux-arm64`；均可用 `FNOS_RUNTIME_DIR` 指定。只复制实际安装的
+Linux glibc 运行依赖，不能用 macOS Sharp 交付 NAS。arm64 示例：
+
+```bash
+FNOS_TARGET_ARCH=arm64 \
+FNOS_RUNTIME_DIR="$PWD/../.tools/native-runtime-linux-arm64" \
+npm run fnos:pack
+```
+
+FNOS 运行时必须在 arm64 容器或 `npm install --os=linux --cpu=arm64` 环境中安装；只改名 x86_64 包不算 arm64 交付。
 
 0.2.2 打包修复：Node 文件复制保留原软链接形式，生产运行目录清理所有 npm `.bin` 命令目录和不使用的 TypeScript 编译器；其余软链接直接阻止构建。旧包存在 9 条指向开发机 `/Users/...` 的链接，不能将本机 tar 能读出归档视为 NAS 解压兼容。`package-files.test.mjs` 覆盖绝对/相对、嵌套命令链接、编译器删除及意外外部链接。
 

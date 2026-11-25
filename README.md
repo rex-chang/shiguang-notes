@@ -145,6 +145,13 @@ npm run fnos:pack
 ```
 
 构建产物为 `fnnotes-m0.fpk`。原生服务、前端、许可证和图标资源会一起写入安装包。
+ARM64 打包需要 `.tools/native-runtime-linux-arm64`，并设置 `FNOS_TARGET_ARCH=arm64`：
+
+```bash
+FNOS_TARGET_ARCH=arm64 \
+FNOS_RUNTIME_DIR="$PWD/../.tools/native-runtime-linux-arm64" \
+npm run fnos:pack
+```
 
 ## 问题反馈
 

@@ -11,6 +11,13 @@ const packageDir = path.join(root, ".build/fnnotes-m0");
 const app = path.join(packageDir, "app");
 const nativeDist = path.join(root, "dist-fnos");
 const metadata = JSON.parse(readFileSync(path.join(root, "src/native/metadata.json")));
+const targetArch = process.env.FNOS_TARGET_ARCH === "arm64" ? "arm64" : "x64";
+const targetPlatform = targetArch === "arm64" ? "arm" : "x86";
+const targetLabel = targetArch === "arm64" ? "arm64" : "x86_64";
+const runtime = process.env.FNOS_RUNTIME_DIR || path.resolve(
+  root,
+  targetArch === "arm64" ? "../.tools/native-runtime-linux-arm64" : "../.tools/native-runtime-linux",
+);
 function run(command, args, env = process.env) { const result = spawnSync(command, args, { cwd: root, env, stdio: "inherit" }); if (result.error || result.status !== 0) throw result.error || new Error("原生构建失败。"); }
 run(process.execPath, ["node_modules/typescript/bin/tsc", "--noEmit", "-p", "tsconfig.json"]);
 rmSync(path.join(root, "dist-server"), { recursive: true, force: true });
@@ -33,16 +40,40 @@ for (const size of [64, 256]) {
   writeFileSync(path.join(app, `ui/images/icon_${size}.png`), icon);
 }
 // 开发机模拟器与测试浏览器不进入原生包；Linux Sharp 运行依赖必须独立准备。
-const runtime = process.env.FNOS_RUNTIME_DIR || path.resolve(root, "../.tools/native-runtime-linux");
-if (!existsSync(path.join(runtime, "node_modules/sharp/package.json"))) throw new Error("缺少 Linux x64 原生运行依赖，请先准备 FNOS_RUNTIME_DIR。");
+const sharpPlatformPackage = targetArch === "arm64"
+  ? "@img/sharp-linux-arm64"
+  : "@img/sharp-linux-x64";
+if (
+  !existsSync(path.join(runtime, "node_modules/sharp/package.json")) ||
+  !existsSync(path.join(runtime, "node_modules", sharpPlatformPackage, "package.json"))
+) {
+  throw new Error(`缺少 Linux ${targetArch} 原生运行依赖，请准备 ${runtime}。`);
+}
 // 七牛的已发布 JS 不调用编译器；npm 命令链接也不属于 NAS 服务运行入口。
 prepareProductionRuntime(path.join(runtime, "node_modules"), path.join(app, "node_modules"));
 for (const filename of readdirSync(path.join(packageDir, "cmd"))) chmodSync(path.join(packageDir, "cmd", filename), 0o755);
 let manifest = readFileSync(path.join(packageDir, "manifest"), "utf8");
-manifest = manifest.replace(/^version\s*=.*$/m, "version=" + metadata.appVersion).replace(/^desc\s*=.*$/m, "desc=拾光便签：NAS 上的私有便签与共享空间，使用飞牛账号登录，支持七种纸张主题、插入图片、导出 PNG 与公众号排版。");
+manifest = manifest
+  .replace(/^version\s*=.*$/m, "version=" + metadata.appVersion)
+  .replace(/^platform\s*=.*$/m, "platform=" + targetPlatform)
+  .replace(/^desc\s*=.*$/m, "desc=拾光便签：NAS 上的私有便签与共享空间，使用飞牛账号登录，支持七种纸张主题、插入图片、导出 PNG 与公众号排版。");
 writeFileSync(path.join(packageDir, "manifest"), manifest);
-writeFileSync(path.join(app, "build-info.json"), JSON.stringify({ ...metadata, png: "client", nasVerified: false }, null, 2));
+writeFileSync(path.join(app, "build-info.json"), JSON.stringify({ ...metadata, targetArch: targetLabel, png: "client", nasVerified: false }, null, 2));
 writeFileSync(path.join(app, "package.json"), JSON.stringify({ type: "module", private: true, version: metadata.appVersion }));
 function clean(dir) { for (const item of readdirSync(dir, { withFileTypes: true })) { const target = path.join(dir, item.name); if (item.name === ".DS_Store" || item.name === ".env" || (item.name.startsWith(".env.") && item.name !== ".env.example") || item.name === ".npmrc") rmSync(target); else if (item.isSymbolicLink()) throw new Error("打包目录包含不支持的软链接：" + path.relative(packageDir, target)); else if (item.isDirectory()) clean(target); } }
 clean(packageDir);
-if (process.argv.includes("--pack")) run(process.env.FN_PACK_BIN || path.resolve(root, "../.tools/fnpack-1.2.3-darwin-arm64"), ["build", "--directory", packageDir]);
+if (process.argv.includes("--pack")) {
+  run(
+    process.env.FN_PACK_BIN || path.resolve(root, "../.tools/fnpack-1.2.3-darwin-arm64"),
+    ["build", "--directory", packageDir],
+  );
+  const packed = [
+    path.join(root, "fnnotes-m0.fpk"),
+    path.join(packageDir, "fnnotes-m0.fpk"),
+  ].find((candidate) => existsSync(candidate));
+  if (packed) {
+    const versioned = path.join(root, `fnnotes-m0_${metadata.appVersion}_${targetLabel}.fpk`);
+    cpSync(packed, versioned);
+    console.log(`FPK: ${versioned}`);
+  }
+}

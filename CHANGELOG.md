@@ -24,6 +24,7 @@
 ### 变更
 
 - Markdown 模式改用 CodeMirror 6，增加 Markdown 语法高亮、标题层级、选区与撤销；图片块、快捷键、实时预览和 Markdown 数据格式保持不变。
+- `FNOS_TARGET_ARCH=arm64` 可生成 `platform=arm` 的 FPK；默认仍为 x86_64，两种包不能混用。
 - 原生目录授权与 NAS 图片读取在飞牛系统 API 未就绪时返回 503，设置页继续显示修复提示。
 - 本地构建说明补充 DSH 插件依赖、Playwright Chromium 与构建步骤。
 
