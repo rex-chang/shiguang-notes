@@ -179,16 +179,22 @@ test("移动端快速输入栏保留官方五等分布局，并把高级语法�
   );
 });
 
-test("便签正文声明为普通多行文本而不是账号或密码字段", () => {
+test("便签正文使用 CodeMirror 并声明多行文本而非账号字段", () => {
   const editorSource = readFileSync("src/components/EditorPanel.tsx", "utf8");
+  const codeMirrorSource = readFileSync(
+    "src/components/MarkdownCodeMirror.tsx",
+    "utf8",
+  );
 
   assert.match(
     editorSource,
-    /<textarea[\s\S]*name=\{`note-content-\$\{blockIndex\}`\}[\s\S]*className=\{`markdown-editor editor-text-segment\$\{[\s\S]*aria-label=\{[\s\S]*"便签正文"[\s\S]*aria-multiline="true"[\s\S]*autoComplete="off"[\s\S]*autoCapitalize="sentences"[\s\S]*inputMode="text"[\s\S]*enterKeyHint="enter"/s,
+    /<MarkdownCodeMirror[\s\S]*ariaLabel=\{[\s\S]*"便签正文"[\s\S]*className=\{`markdown-editor editor-text-segment\$\{/s,
   );
+  assert.match(codeMirrorSource, /"aria-multiline": "true"/);
+  assert.match(codeMirrorSource, /spellcheck: "false"/);
   assert.doesNotMatch(
     editorSource,
-    /<textarea[\s\S]*id="markdown-editor"[\s\S]*autoComplete="(?:username|current-password|new-password|one-time-code)"/s,
+    /autoComplete="(?:username|current-password|new-password|one-time-code)"/,
   );
   assert.doesNotMatch(
     editorSource,

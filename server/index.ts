@@ -3683,7 +3683,7 @@ async function renderNotePng(markdown: string, renderUrl: string): Promise<Buffe
       waitUntil: "domcontentloaded",
     });
 
-    const editor = page.locator("#markdown-editor");
+    const editor = page.locator(".markdown-editor .cm-content");
     await editor.waitFor();
     await editor.fill(markdown);
     await waitForAssets(page);

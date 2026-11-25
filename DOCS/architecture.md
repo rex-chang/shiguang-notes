@@ -159,6 +159,12 @@ Vite 生产构建必须使用站点根路径 `/` 作为 `base`，使这两个嵌
 `notes.anonymous.workspace.v1`，已有工作区也会自动补齐新增字段。侧栏只显示更新时间和从
 Markdown 自动提取的标题或第一句话。
 
+Markdown 模式的文本段由 `src/components/MarkdownCodeMirror.tsx` 提供 CodeMirror 6
+编辑面，启用 Markdown 语法高亮、选区、撤销和代码块编辑；图片块、拖拽、裁剪、
+删除、粘贴导入仍由 `EditorPanel` 管理。Markdown 字符串始终是唯一持久化数据源，
+`MarkdownText` / `NoteSheet` 仍是预览、PNG、归档和公众号的渲染链路；富文本模式
+继续使用独立的 `RichTextEditor`，两种模式不共享编辑器实例。
+
 便签详情状态同时写入 URL hash：
 `#note=<便签 ID>&view=editor|preview`。刷新和浏览器历史导航会在工作区初始化后按
 ID 恢复当前便签及编辑 / 预览状态；无效 ID 回到列表。hash 与现有查询参数分开，

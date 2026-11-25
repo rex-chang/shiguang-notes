@@ -165,7 +165,7 @@ test("直达手机编辑页时会在隐藏面板恢复可见后重算正文高�
 
   assert.match(
     editorSource,
-    /const resizeEditorContent = useCallback\(\(\): void => \{[\s\S]*if \(!scroller \|\| scroller\.clientWidth === 0\) \{[\s\S]*textarea\.style\.height = "0px";[\s\S]*textarea\.scrollHeight > textarea\.clientHeight[\s\S]*textarea\.style\.height = `\$\{textarea\.scrollHeight\}px`;/s,
+    /const resizeEditorContent = useCallback\(\(\): void => \{[\s\S]*if \(!scroller \|\| scroller\.clientWidth === 0\) \{[\s\S]*for \(const view of editorRefs\.current\.values\(\)\) \{[\s\S]*view\.requestMeasure\(\);/s,
   );
   assert.match(
     editorSource,
@@ -603,6 +603,10 @@ test("移动端锁定一倍视口并禁止双指缩放与输入框自动放大",
 test("移动端采用便签列表、编辑和预览三态工作区", () => {
   const appSource = readFileSync("src/App.tsx", "utf8");
   const editorSource = readFileSync("src/components/EditorPanel.tsx", "utf8");
+  const codeMirrorSource = readFileSync(
+    "src/components/MarkdownCodeMirror.tsx",
+    "utf8",
+  );
   const styles = readFileSync("src/styles.css", "utf8");
 
   assert.match(
@@ -666,37 +670,34 @@ test("移动端采用便签列表、编辑和预览三态工作区", () => {
   );
   assert.match(
     editorSource,
-    /caretMirrorTextRef[\s\S]*caretMirrorAnchorRef[\s\S]*mobileCaretRef[\s\S]*scheduleMobileCaretSync/,
+    /<MarkdownCodeMirror[\s\S]*onCompositionStart=\{\(\) => \{[\s\S]*isComposingRef\.current = true;/s,
   );
   assert.match(
     editorSource,
-    /textarea\.selectionStart !== textarea\.selectionEnd[\s\S]*hideMobileCaret\(\);[\s\S]*uses-fixed-mobile-caret/,
+    /onCompositionEnd=\{\(\) => \{[\s\S]*isComposingRef\.current = false;/s,
   );
   assert.match(
     editorSource,
-    /onCompositionStart=\{\(\) => \{[\s\S]*isComposingRef\.current = true;[\s\S]*hideMobileCaret\(\);[\s\S]*onCompositionEnd=\{\(\) => \{[\s\S]*isComposingRef\.current = false;[\s\S]*scheduleMobileCaretSync\(\);/,
+    /function syncSelection\(\): void \{[\s\S]*document\.activeElement\?\.closest\("\.cm-editor"\)/s,
+  );
+  assert.match(
+    editorSource,
+    /function updateBlockSelection\([\s\S]*absoluteSelectionForBlock\(block, selection\)/s,
+  );
+  assert.match(
+    codeMirrorSource,
+    /EditorView\.contentAttributes\.of\(\{[\s\S]*"aria-multiline": "true"/s,
+  );
+  assert.match(
+    styles,
+    /\.markdown-editor \.cm-editor \{[\s\S]*min-height:\s*var\(--editor-line-height\)/s,
   );
   assert.doesNotMatch(
     editorSource,
     /markdown-editor-selection-handle|selectionStartHandleRef|selectionEndHandleRef|EDITOR_EMPTY_LINE_MARKER|toEditorDisplayText/,
   );
   assert.doesNotMatch(styles, /\.markdown-editor-selection-handle/);
-  assert.match(
-    editorSource,
-    /document\.addEventListener\("selectionchange", syncNativeSelectionChange\);[\s\S]*document\.removeEventListener\("selectionchange", syncNativeSelectionChange\);/s,
-  );
-  assert.match(
-    editorSource,
-    /const syncNativeSelectionChange = \(\): void => \{\s*syncSelection\(\);\s*\};/,
-  );
-  assert.match(
-    editorSource,
-    /start:\s*active\.block\.start \+ localStart,[\s\S]*end:\s*active\.block\.start \+ localEnd,/s,
-  );
-  assert.match(
-    editorSource,
-    /value=\{block\.text\}[\s\S]*className="markdown-editor-caret-mirror"[\s\S]*className="markdown-editor-fixed-caret"/s,
-  );
+  assert.doesNotMatch(styles, /markdown-editor-caret-mirror|markdown-editor-fixed-caret/);
   assert.match(
     styles,
     /--editor-selection-bg:\s*rgba\(166,\s*139,\s*117,\s*0\.2\);[\s\S]*--editor-caret-color:\s*#a68b75;/s,
@@ -704,11 +705,7 @@ test("移动端采用便签列表、编辑和预览三态工作区", () => {
   assert.match(
     styles,
     // 手机端行高同样跟随便签字号档位缩放。
-    /@media \(max-width: 640px\)[\s\S]*--editor-line-height:\s*calc\(42px \* var\(--note-font-scale, 1\)\);[\s\S]*\.markdown-editor\.uses-fixed-mobile-caret\s*\{[^}]*caret-color:\s*transparent;[^}]*\}[\s\S]*\.markdown-editor-fixed-caret\s*\{[^}]*height:\s*22px;[^}]*background:\s*var\(--editor-caret-color\);/s,
-  );
-  assert.match(
-    styles,
-    /\.markdown-editor-caret-mirror,\s*\.markdown-editor-fixed-caret\s*\{[^}]*display:\s*none;[^}]*\}[\s\S]*@media \(max-width: 640px\)[\s\S]*\.markdown-editor-caret-mirror\s*\{[^}]*visibility:\s*hidden;[^}]*white-space:\s*pre-wrap;/s,
+    /@media \(max-width: 640px\)[\s\S]*--editor-line-height:\s*calc\(42px \* var\(--note-font-scale, 1\)\);/s,
   );
   assert.match(
     styles,
@@ -776,7 +773,7 @@ test("移动端采用便签列表、编辑和预览三态工作区", () => {
   );
   assert.match(
     editorSource,
-    /const scrollTop = scroller\.scrollTop;[\s\S]*textarea\.style\.height = "0px";[\s\S]*scroller\.scrollTop = scrollTop;/s,
+    /const scrollTop = scroller\.scrollTop;[\s\S]*for \(const view of editorRefs\.current\.values\(\)\) \{[\s\S]*view\.requestMeasure\(\);[\s\S]*scroller\.scrollTop = scrollTop;/s,
   );
   assert.match(
     styles,

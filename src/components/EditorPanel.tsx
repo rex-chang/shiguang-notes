@@ -9,12 +9,16 @@ import {
   useRef,
   useState,
   type ChangeEvent,
-  type ClipboardEvent,
   type DragEvent,
-  type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { createPortal } from "react-dom";
+import { EditorView } from "@codemirror/view";
+import { EditorSelection } from "@codemirror/state";
+import {
+  MarkdownCodeMirror,
+  type MarkdownCodeMirrorSelection,
+} from "./MarkdownCodeMirror";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ImageCropDialog } from "./ImageCropDialog";
 import { importImageFile, importImageUrl } from "../lib/images";
@@ -111,54 +115,6 @@ function getEditorImageKey(image: EditorImageBlock): string {
   return `${image.markerStart}:${image.source}`;
 }
 
-function collectVisualLineOffsets(
-  textarea: HTMLTextAreaElement,
-  text: string,
-): number[] {
-  const style = getComputedStyle(textarea);
-  const contentWidth = Math.max(
-    1,
-    textarea.clientWidth -
-      Number.parseFloat(style.paddingLeft) -
-      Number.parseFloat(style.paddingRight),
-  );
-  const canvas = document.createElement("canvas");
-  const context = canvas.getContext("2d");
-
-  if (!context) {
-    return [0, text.length];
-  }
-
-  context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
-  const letterSpacing = Number.parseFloat(style.letterSpacing) || 0;
-  const offsets = [0];
-  let lineWidth = 0;
-
-  for (let index = 0; index < text.length; index += 1) {
-    const character = text[index];
-
-    if (character === "\n") {
-      offsets.push(index + 1);
-      lineWidth = 0;
-      continue;
-    }
-
-    const characterWidth = context.measureText(character).width + letterSpacing;
-
-    if (lineWidth > 0 && lineWidth + characterWidth > contentWidth) {
-      offsets.push(index);
-      lineWidth = characterWidth;
-    } else {
-      lineWidth += characterWidth;
-    }
-  }
-
-  if (offsets.at(-1) !== text.length) {
-    offsets.push(text.length);
-  }
-
-  return Array.from(new Set(offsets));
-}
 
 export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(function EditorPanel(
   {
@@ -171,14 +127,9 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
 ) {
   const editorFrameRef = useRef<HTMLDivElement | null>(null);
   const editorScrollRef = useRef<HTMLDivElement | null>(null);
-  const textareaRefs = useRef(new Map<number, HTMLTextAreaElement>());
+  const editorRefs = useRef(new Map<number, EditorView>());
   const captionInputRefs = useRef(new Map<string, HTMLInputElement>());
   const imageInputRef = useRef<HTMLInputElement | null>(null);
-  const caretMirrorRef = useRef<HTMLDivElement | null>(null);
-  const caretMirrorTextRef = useRef<HTMLSpanElement | null>(null);
-  const caretMirrorAnchorRef = useRef<HTMLSpanElement | null>(null);
-  const mobileCaretRef = useRef<HTMLSpanElement | null>(null);
-  const caretSyncFrameRef = useRef<number | null>(null);
   const imageDragCleanupRef = useRef<(() => void) | null>(null);
   const isComposingRef = useRef(false);
   const keyboardBaselineHeightRef = useRef<number | null>(null);
@@ -220,6 +171,36 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
   const advancedMarkdownShortcuts = MARKDOWN_SHORTCUTS.filter(
     (shortcut) => !MOBILE_MARKDOWN_PRIMARY_ACTIONS.includes(shortcut.action),
   );
+  function localSelectionForBlock(
+    block: EditorTextBlock,
+  ): MarkdownCodeMirrorSelection {
+    return {
+      start: Math.max(0, Math.min(block.text.length, selectionRef.current.start - block.start)),
+      end: Math.max(0, Math.min(block.text.length, selectionRef.current.end - block.start)),
+    };
+  }
+
+  function absoluteSelectionForBlock(
+    block: EditorTextBlock,
+    selection: MarkdownCodeMirrorSelection,
+  ): { end: number; start: number } {
+    const start = Math.max(0, Math.min(block.text.length, selection.start));
+    const end = Math.max(start, Math.min(block.text.length, selection.end));
+    return { end: block.start + end, start: block.start + start };
+  }
+
+  function getEditorView(blockIndex: number): EditorView | null {
+    return editorRefs.current.get(blockIndex) ?? null;
+  }
+
+
+  function updateBlockSelection(
+    block: EditorTextBlock,
+    selection: MarkdownCodeMirrorSelection,
+  ): void {
+    selectionRef.current = absoluteSelectionForBlock(block, selection);
+  }
+
 
   useEffect(() => {
     const imageKeys = new Set(
@@ -282,118 +263,6 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
     [],
   );
 
-  const hideMobileCaret = useCallback((): void => {
-    for (const textarea of textareaRefs.current.values()) {
-      textarea.classList.remove("uses-fixed-mobile-caret");
-    }
-
-    mobileCaretRef.current?.classList.remove("is-visible");
-  }, []);
-
-  const updateMobileCaret = useCallback((): void => {
-    caretSyncFrameRef.current = null;
-
-    const flow = editorScrollRef.current;
-    const mirror = caretMirrorRef.current;
-    const mirrorText = caretMirrorTextRef.current;
-    const mirrorAnchor = caretMirrorAnchorRef.current;
-    const caret = mobileCaretRef.current;
-    const textarea = Array.from(textareaRefs.current.values()).find(
-      (candidate) => document.activeElement === candidate,
-    );
-
-    if (
-      !flow ||
-      !mirror ||
-      !mirrorText ||
-      !mirrorAnchor ||
-      !caret ||
-      !textarea ||
-      !window.matchMedia("(max-width: 640px)").matches ||
-      isComposingRef.current ||
-      textarea.selectionStart !== textarea.selectionEnd
-    ) {
-      hideMobileCaret();
-      return;
-    }
-
-    const textareaStyle = window.getComputedStyle(textarea);
-    mirror.style.top = `${textarea.offsetTop}px`;
-    mirror.style.left = `${textarea.offsetLeft}px`;
-    mirror.style.width = `${textarea.offsetWidth}px`;
-    mirror.style.height = `${textarea.scrollHeight}px`;
-    mirror.style.padding = textareaStyle.padding;
-    mirror.style.fontFamily = textareaStyle.fontFamily;
-    mirror.style.fontSize = textareaStyle.fontSize;
-    mirror.style.fontStyle = textareaStyle.fontStyle;
-    mirror.style.fontWeight = textareaStyle.fontWeight;
-    mirror.style.letterSpacing = textareaStyle.letterSpacing;
-    mirror.style.lineHeight = textareaStyle.lineHeight;
-    mirror.style.textAlign = textareaStyle.textAlign;
-    mirror.style.textIndent = textareaStyle.textIndent;
-    mirror.style.textTransform = textareaStyle.textTransform;
-    mirror.style.wordSpacing = textareaStyle.wordSpacing;
-    mirrorText.textContent = textarea.value.slice(0, textarea.selectionStart);
-
-    const caretStyle = window.getComputedStyle(caret);
-    const caretHeight = Number.parseFloat(caretStyle.height) || 22;
-    const anchorHeight = mirrorAnchor.offsetHeight || caretHeight;
-    const left = textarea.offsetLeft + mirrorAnchor.offsetLeft;
-    const top =
-      textarea.offsetTop +
-      mirrorAnchor.offsetTop +
-      Math.max(0, (anchorHeight - caretHeight) / 2);
-
-    if (
-      left < flow.scrollLeft ||
-      left > flow.scrollLeft + flow.clientWidth ||
-      top + caretHeight < flow.scrollTop ||
-      top > flow.scrollTop + flow.clientHeight
-    ) {
-      hideMobileCaret();
-      return;
-    }
-
-    for (const candidate of textareaRefs.current.values()) {
-      candidate.classList.toggle(
-        "uses-fixed-mobile-caret",
-        candidate === textarea,
-      );
-    }
-
-    caret.style.transform = `translate3d(${left}px, ${top}px, 0)`;
-    caret.classList.remove("is-visible");
-    void caret.offsetWidth;
-    caret.classList.add("is-visible");
-  }, [hideMobileCaret]);
-
-  const scheduleMobileCaretSync = useCallback((): void => {
-    if (caretSyncFrameRef.current !== null) {
-      window.cancelAnimationFrame(caretSyncFrameRef.current);
-    }
-
-    caretSyncFrameRef.current = window.requestAnimationFrame(updateMobileCaret);
-  }, [updateMobileCaret]);
-
-  useEffect(() => {
-    scheduleMobileCaretSync();
-  }, [markdown, scheduleMobileCaretSync]);
-
-  useEffect(() => {
-    const viewport = window.visualViewport;
-
-    window.addEventListener("resize", scheduleMobileCaretSync);
-    viewport?.addEventListener("resize", scheduleMobileCaretSync);
-
-    return () => {
-      window.removeEventListener("resize", scheduleMobileCaretSync);
-      viewport?.removeEventListener("resize", scheduleMobileCaretSync);
-
-      if (caretSyncFrameRef.current !== null) {
-        window.cancelAnimationFrame(caretSyncFrameRef.current);
-      }
-    };
-  }, [scheduleMobileCaretSync]);
 
   const syncEditorPaperScroll = useCallback((): void => {
     const scroller = editorScrollRef.current;
@@ -404,9 +273,7 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
         `${-scroller.scrollTop}px`,
       );
     }
-
-    scheduleMobileCaretSync();
-  }, [scheduleMobileCaretSync]);
+  }, []);
 
   useEffect(() => {
     syncEditorPaperScroll();
@@ -427,8 +294,8 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
       }
 
       const viewportHeight = getViewportHeight();
-      const isEditorFocused = Array.from(textareaRefs.current.values()).includes(
-        document.activeElement as HTMLTextAreaElement,
+      const isEditorFocused = Boolean(
+        document.activeElement?.closest(".markdown-editor"),
       );
 
       if (!isEditorFocused) {
@@ -473,34 +340,9 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
     }
 
     const scrollTop = scroller.scrollTop;
-    const textareas: HTMLTextAreaElement[] = [];
 
-    for (const [blockIndex, textarea] of textareaRefs.current) {
-      const block = editorContent[blockIndex];
-
-      if (!block || block.kind !== "text") {
-        continue;
-      }
-
-      textarea.style.height = "0px";
-      textareas.push(textarea);
-    }
-
-    for (const textarea of textareas) {
-      textarea.style.height = `${Math.max(
-        textarea.scrollHeight,
-        Number.parseFloat(
-          getComputedStyle(textarea).getPropertyValue("--editor-line-height"),
-        ) || 42,
-      )}px`;
-    }
-
-    // A tall textarea can make the flow scrollbar appear and narrow the text
-    // after the first measurement. Settle that second wrapping pass as well.
-    for (const textarea of textareas) {
-      if (textarea.scrollHeight > textarea.clientHeight) {
-        textarea.style.height = `${textarea.scrollHeight}px`;
-      }
+    for (const view of editorRefs.current.values()) {
+      view.requestMeasure();
     }
 
     for (const imageBlock of scroller.querySelectorAll<HTMLElement>(
@@ -592,56 +434,28 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
     );
   }
 
-  function getActiveTextBlock(): {
-    block: EditorTextBlock;
-    blockIndex: number;
-    textarea: HTMLTextAreaElement;
-  } | null {
-    const activeElement = document.activeElement;
-
-    for (const [blockIndex, textarea] of textareaRefs.current) {
-      const block = editorContent[blockIndex];
-
-      if (
-        activeElement === textarea &&
-        block &&
-        block.kind === "text"
-      ) {
-        return { block, blockIndex, textarea };
-      }
-    }
-
-    return null;
-  }
-
   function syncSelection(): void {
-    const active = getActiveTextBlock();
+    const activeElement = document.activeElement?.closest(".cm-editor");
 
-    if (!active) {
+    if (!activeElement) {
       return;
     }
 
-    const localStart = active.textarea.selectionStart ?? 0;
-    const localEnd = active.textarea.selectionEnd ?? localStart;
+    for (const [blockIndex, view] of editorRefs.current) {
+      if (view.dom !== activeElement && !view.dom.contains(activeElement)) {
+        continue;
+      }
 
-    selectionRef.current = {
-      start: active.block.start + localStart,
-      end: active.block.start + localEnd,
-    };
-    scheduleMobileCaretSync();
+      const block = editorContent[blockIndex];
+      if (!block || block.kind !== "text") {
+        return;
+      }
+
+      const selection = view.state.selection.main;
+      updateBlockSelection(block, { end: selection.to, start: selection.from });
+      return;
+    }
   }
-
-  useEffect(() => {
-    const syncNativeSelectionChange = (): void => {
-      syncSelection();
-    };
-
-    document.addEventListener("selectionchange", syncNativeSelectionChange);
-
-    return () => {
-      document.removeEventListener("selectionchange", syncNativeSelectionChange);
-    };
-  }, [editorContent, scheduleMobileCaretSync]);
 
   function focusGlobalSelection(
     nextMarkdown: string,
@@ -681,16 +495,15 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
     );
 
     window.requestAnimationFrame(() => {
-      const textarea = textareaRefs.current.get(targetBlockIndex);
+      const view = getEditorView(targetBlockIndex);
 
-      if (!textarea) {
+      if (!view) {
         return;
       }
 
-      textarea.focus();
-      textarea.setSelectionRange(localStart, localEnd);
-      textarea.scrollIntoView({ block: "nearest" });
-      scheduleMobileCaretSync();
+      view.dispatch({
+        effects: EditorView.scrollIntoView(localStart, { y: "nearest" }),
+      });
     });
   }
 
@@ -795,8 +608,6 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
     const imageKey = getEditorImageKey(image);
     setActiveImageKey(null);
     setCaptionImageKey(imageKey);
-    hideMobileCaret();
-
     window.requestAnimationFrame(() => {
       const input = captionInputRefs.current.get(imageKey);
       input?.focus();
@@ -922,28 +733,26 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
   function getImageDropTargets(): Array<{ offset: number; y: number }> {
     const targets: Array<{ offset: number; y: number }> = [];
 
-    for (const [blockIndex, textarea] of textareaRefs.current) {
+    for (const [blockIndex, view] of editorRefs.current) {
       const block = editorContent[blockIndex];
 
       if (!block || block.kind !== "text") {
         continue;
       }
 
-      const style = getComputedStyle(textarea);
-      const lineHeight = Number.parseFloat(style.lineHeight) || 42;
-      const paddingTop = Number.parseFloat(style.paddingTop) || 0;
-      const rect = textarea.getBoundingClientRect();
-      const offsets = collectVisualLineOffsets(textarea, block.text);
+      const lineHeight = Number.parseFloat(getComputedStyle(view.dom).lineHeight) || 42;
 
-      offsets.forEach((offset, lineIndex) => {
-        targets.push({
-          offset: block.start + offset,
-          y: Math.min(
-            rect.bottom,
-            rect.top + paddingTop + lineIndex * lineHeight + lineHeight / 2,
-          ),
-        });
-      });
+      for (let lineNumber = 1; lineNumber <= view.state.doc.lines; lineNumber += 1) {
+        const line = view.state.doc.line(lineNumber);
+        const coords = view.coordsAtPos(line.from);
+
+        if (coords) {
+          targets.push({
+            offset: block.start + line.from,
+            y: coords.top + lineHeight / 2,
+          });
+        }
+      }
     }
 
     return targets;
@@ -965,7 +774,6 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
 
     event.preventDefault();
     event.stopPropagation();
-    hideMobileCaret();
     const pointerId = event.pointerId;
     const startY = event.clientY;
     let hasMoved = false;
@@ -1052,12 +860,13 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
   }
 
   function handleEditorKeyDown(
-    event: KeyboardEvent<HTMLTextAreaElement>,
+    event: globalThis.KeyboardEvent,
+    view: EditorView,
     block: EditorTextBlock,
     blockIndex: number,
-  ): void {
-    const selectionStart = event.currentTarget.selectionStart;
-    const selectionEnd = event.currentTarget.selectionEnd;
+  ): boolean {
+    const selectionStart = view.state.selection.main.from;
+    const selectionEnd = view.state.selection.main.to;
     const previousBlock = editorContent[blockIndex - 1];
     const nextBlock = editorContent[blockIndex + 1];
 
@@ -1069,7 +878,7 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
     ) {
       event.preventDefault();
       requestImageDeletion(previousBlock, block.start);
-      return;
+      return true;
     }
 
     if (
@@ -1080,7 +889,7 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
     ) {
       event.preventDefault();
       requestImageDeletion(nextBlock, block.end);
-      return;
+      return true;
     }
 
     if (
@@ -1089,9 +898,9 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
       event.altKey ||
       event.ctrlKey ||
       event.metaKey ||
-      event.nativeEvent.isComposing
+      isComposingRef.current
     ) {
-      return;
+      return false;
     }
 
     const edit = continueMarkdownBlock(
@@ -1101,11 +910,12 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
     );
 
     if (!edit) {
-      return;
+      return false;
     }
 
     event.preventDefault();
     commitMarkdownEdit(edit);
+    return true;
   }
 
   function insertImageMarkdown(imageUrl: string): void {
@@ -1162,52 +972,45 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
     return isLikelyImageUrl(trimmedText) ? trimmedText : null;
   }
 
-  async function importFromClipboard(event: ClipboardEvent<HTMLTextAreaElement>): Promise<void> {
-    const fileFromItems = Array.from(event.clipboardData.items)
+  function handleMarkdownPaste(
+    event: globalThis.ClipboardEvent,
+    _view: EditorView,
+  ): boolean {
+    const fileFromItems = Array.from(event.clipboardData?.items ?? [])
       .filter((item) => item.kind === "file")
       .map((item) => item.getAsFile())
       .find((file): file is File => Boolean(file?.type.startsWith("image/")));
 
     if (fileFromItems) {
       event.preventDefault();
-      await handleImportedSource(fileFromItems);
-      return;
+      void handleImportedSource(fileFromItems);
+      return true;
     }
 
     const clipboardUrl = pickUrlFromTransfer(
-      event.clipboardData.getData("text/html"),
-      event.clipboardData.getData("text/plain"),
+      event.clipboardData?.getData("text/html") ?? "",
+      event.clipboardData?.getData("text/plain") ?? "",
     );
 
     if (!clipboardUrl) {
-      return;
+      return false;
     }
 
     event.preventDefault();
-    await handleImportedSource(clipboardUrl);
+    void handleImportedSource(clipboardUrl);
+    return true;
   }
 
   function handleTextBlockChange(
-    event: ChangeEvent<HTMLTextAreaElement>,
     block: EditorTextBlock,
+    nextValue: string,
+    selection: MarkdownCodeMirrorSelection,
   ): void {
-    const nextValue = event.target.value;
-    const localSelectionStart =
-      event.target.selectionStart ?? nextValue.length;
-    const localSelectionEnd =
-      event.target.selectionEnd ?? localSelectionStart;
     const nextMarkdown = `${markdown.slice(0, block.start)}${nextValue}${markdown.slice(
       block.end,
     )}`;
-    const selectionStart = block.start + localSelectionStart;
-    const selectionEnd = block.start + localSelectionEnd;
-
-    selectionRef.current = {
-      end: selectionEnd,
-      start: selectionStart,
-    };
+    selectionRef.current = absoluteSelectionForBlock(block, selection);
     onMarkdownChange(nextMarkdown);
-    scheduleMobileCaretSync();
   }
 
   async function importFromDrop(event: DragEvent<HTMLElement>): Promise<void> {
@@ -1311,49 +1114,29 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
           ) : null}
           {editorContent.map((block, blockIndex) =>
             block.kind === "text" ? (
-              <textarea
-                readOnly={readOnly}
-                id={blockIndex === 0 ? "markdown-editor" : undefined}
-                key={`text-${blockIndex}`}
-                name={`note-content-${blockIndex}`}
-                ref={(textarea) => {
-                  if (textarea) {
-                    textareaRefs.current.set(blockIndex, textarea);
-                  } else {
-                    textareaRefs.current.delete(blockIndex);
-                  }
-                }}
+              <MarkdownCodeMirror
+                ariaLabel={
+                  editorContent.length === 1
+                    ? "便签正文"
+                    : `便签正文第 ${Math.floor(blockIndex / 2) + 1} 段`
+                }
                 className={`markdown-editor editor-text-segment${
                   blockIndex === editorContent.length - 1
                     ? " is-last-text-segment"
                     : ""
                 }`}
-                aria-label={
-                  editorContent.length === 1
-                    ? "便签正文"
-                    : `便签正文第 ${Math.floor(blockIndex / 2) + 1} 段`
-                }
-                aria-multiline="true"
-                autoComplete="off"
-                autoCapitalize="sentences"
-                inputMode="text"
-                enterKeyHint="enter"
-                value={block.text}
-                onChange={(event) => handleTextBlockChange(event, block)}
-                onSelect={syncSelection}
-                onClick={syncSelection}
-                onKeyDown={(event) =>
-                  handleEditorKeyDown(event, block, blockIndex)
-                }
-                onKeyUp={syncSelection}
-                onPointerDown={hideMobileCaret}
-                onCompositionStart={() => {
-                  isComposingRef.current = true;
-                  hideMobileCaret();
+                key={`text-${blockIndex}`}
+                onBlur={() => {
+                  setIsQuickInputVisible(false);
                 }}
+                onChange={(nextText, selection) =>
+                  handleTextBlockChange(block, nextText, selection)
+                }
                 onCompositionEnd={() => {
                   isComposingRef.current = false;
-                  scheduleMobileCaretSync();
+                }}
+                onCompositionStart={() => {
+                  isComposingRef.current = true;
                 }}
                 onFocus={() => {
                   if (window.matchMedia("(max-width: 640px)").matches) {
@@ -1364,18 +1147,22 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
                       window.visualViewport?.height ?? window.innerHeight,
                     );
                   }
-
-                  syncSelection();
-                  scheduleMobileCaretSync();
                 }}
-                onBlur={() => {
-                  setIsQuickInputVisible(false);
-                  hideMobileCaret();
+                onKeyDown={(event, view) =>
+                  handleEditorKeyDown(event, view, block, blockIndex)
+                }
+                onPaste={handleMarkdownPaste}
+                onSelect={(selection) => updateBlockSelection(block, selection)}
+                onViewReady={(view) => {
+                  if (view) {
+                    editorRefs.current.set(blockIndex, view);
+                  } else {
+                    editorRefs.current.delete(blockIndex);
+                  }
                 }}
-                onPaste={(event) => {
-                  void importFromClipboard(event);
-                }}
-                spellCheck={false}
+                readOnly={readOnly}
+                selection={localSelectionForBlock(block)}
+                text={block.text}
               />
             ) : (
               <figure
@@ -1510,7 +1297,6 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
                     onClick={(event) => event.stopPropagation()}
                     onFocus={() => {
                       setActiveImageKey(null);
-                      hideMobileCaret();
                     }}
                   />
                 ) : null}
@@ -1533,19 +1319,6 @@ export const EditorPanel = forwardRef<EditorPanelHandle, EditorPanelProps>(funct
               </figure>
             ),
           )}
-          <div
-            ref={caretMirrorRef}
-            className="markdown-editor-caret-mirror"
-            aria-hidden="true"
-          >
-            <span ref={caretMirrorTextRef} />
-            <span ref={caretMirrorAnchorRef}>{"\u200b"}</span>
-          </div>
-          <span
-            ref={mobileCaretRef}
-            className="markdown-editor-fixed-caret"
-            aria-hidden="true"
-          />
         </div>
       </div>
       {isQuickInputVisible ? (

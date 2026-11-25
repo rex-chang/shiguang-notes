@@ -177,13 +177,16 @@ async function waitForEditorValue(
   expected: string,
   timeoutMs = 15_000,
 ): Promise<string> {
-  await page.waitForSelector("#markdown-editor", { timeout: timeoutMs });
+  await page.waitForSelector(".markdown-editor .cm-editor", {
+    timeout: timeoutMs,
+  });
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
     const value = await page
-      .locator("#markdown-editor")
-      .inputValue()
+      .locator(".markdown-editor .cm-content")
+      .first()
+      .evaluate((element) => element.textContent ?? "")
       .catch(() => "");
     if (value.includes(expected)) {
       return value;
@@ -277,6 +280,8 @@ test("登录账号正文不写入本地，退出和换账号都不会继承", as
     const page = await browserContext.newPage();
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await waitForEditorValue(page, "CLOUD-A");
+    assert.equal(await page.locator("#markdown-editor").count(), 0);
+    assert.ok((await page.locator(".markdown-editor .cm-editor").count()) > 0);
 
     assert.equal(await readLocalStorage(page, LEGACY_KEY), null);
     assert.equal(await readLocalStorage(page, LEGACY_DRAFT_KEY), null);
@@ -331,7 +336,7 @@ test("登录账号正文不写入本地，退出和换账号都不会继承", as
       { name: "test-user", value: "C", url: baseUrl },
     ]);
     await legacyPage.reload({ waitUntil: "domcontentloaded" });
-    await legacyPage.waitForSelector("#markdown-editor");
+    await legacyPage.waitForSelector(".markdown-editor .cm-editor");
     await legacyPage.waitForTimeout(500);
     const cPuts = state.puts.filter((entry) => entry.user === "C");
     assert.ok(cPuts.length > 0);
