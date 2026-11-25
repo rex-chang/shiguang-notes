@@ -2,6 +2,13 @@
 
 set -eu
 
+# install/upgrade callbacks are not guaranteed to run as root on every fnOS
+# version. Self-update sudoers is optional; never fail the whole installation.
+if [ "$(id -u)" -ne 0 ]; then
+  echo "跳过自更新 sudoers：安装回调未以 root 运行。" >&2
+  exit 0
+fi
+
 : "${TRIM_PKGVAR:?}" "${TRIM_USERNAME:?}" "${TRIM_GROUPNAME:?}"
 UPDATE_DIR="$TRIM_PKGVAR/updates"
 RULE_FILE="/etc/sudoers.d/fnnotes-m0-update"
